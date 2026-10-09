@@ -29,7 +29,7 @@ $blurred = count($media) - count($sharp);
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;position:relative}
   .card img{width:100%;height:200px;object-fit:cover;display:block;background:#0a0b10}
   .tag{position:absolute;top:8px;left:8px;background:rgba(0,0,0,.65);padding:3px 8px;border-radius:8px;font-size:11px;letter-spacing:.3px}
-  .tag.blur{background:#7c3aed} .tag.vid{background:#dc2626}
+  .tag.blur{background:#7c3aed} .tag.vid{background:#dc2626;top:34px} .tag.ok{background:#059669}
   .card .dl{position:absolute;top:8px;right:8px;background:rgba(0,0,0,.65);padding:4px 9px;border-radius:8px;font-size:12px;color:#fff;text-decoration:none}
   .err{max-width:700px;margin:24px auto;padding:14px 16px;background:#2a1418;border:1px solid #552;border-radius:12px;color:#fca5a5}
   .note{max-width:700px;margin:18px auto;color:var(--mut);font-size:13px;padding:0 16px;text-align:center}
@@ -56,7 +56,7 @@ $blurred = count($media) - count($sharp);
       <b><?= htmlspecialchars($prof['title']) ?></b> — <?= (int)$prof['posts'] ?> posts ·
       <?= count($photos) ?> médias · <?= count($thumbs) ?> vidéos ·
       <span title="Médias non floutés">✔ <?= count($sharp) ?> nets</span> ·
-      <span title="Médias encore floutés">░ <?= $blurred ?> floutés</span>
+      <span title="Médias encore floutés (tentatives en cours)">░ <?= $blurred ?> floutés</span>
     </div>
     <div>
       <a class="btn" href="?u=<?= urlencode($user) ?>">↻ Rafraîchir</a>
@@ -75,6 +75,7 @@ $blurred = count($media) - count($sharp);
           <a href="media.php?u=<?= urlencode($user) ?>&id=<?= rawurlencode($m['id']) ?>" target="_blank">
             <img loading="lazy" src="media.php?u=<?= urlencode($user) ?>&id=<?= rawurlencode($m['id']) ?>" alt="">
           </a>
+          <?php if (!empty($m['deblurred'])): ?><span class="tag ok">déflouté ✓</span><?php endif; ?>
           <?php if ($m['blur']): ?><span class="tag blur">flouté</span><?php endif; ?>
           <?php if ($m['thumb'] || $m['is_vid']): ?><span class="tag vid">vidéo <?= htmlspecialchars($m['dur']) ?></span><?php endif; ?>
           <a class="dl" href="media.php?u=<?= urlencode($user) ?>&id=<?= rawurlencode($m['id']) ?>&dl=1">⬇</a>
@@ -82,9 +83,10 @@ $blurred = count($media) - count($sharp);
       <?php endforeach; ?>
     </div>
     <p class="note">
-      « flouté » = aperçu gratuit d'un contenu verrouillé. Quand c'est possible, la version non
-      floutée est servie automatiquement (défloutage best-effort). Le proxy tente de récupérer une
-      nouvelle URL lorsque l'ancienne expire, tant que le média reste disponible sur le profil public.
+      « flouté » = aperçu gratuit d'un contenu verrouillé. Les tentatives de défloutage
+      (variante non floutée, même signature) sont retentées en continu ; quand une
+      variante répond 200, le média net est servi et mémorisé. Le proxy récupère aussi
+      une nouvelle URL signée lorsque l'ancienne expire.
     </p>
   <?php endif; ?>
 <?php endif; ?>

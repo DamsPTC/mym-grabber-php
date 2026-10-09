@@ -14,18 +14,43 @@ $n = 0;
 foreach ($prof['media'] as $m) {
     if ($m['thumb']) continue;          // on saute les miniatures
     if ($n >= 120) break;
-    if (mym_media_needs_refresh($m)) {
-        $m = mym_refresh_media($user, $m);
-        if (!$m) continue;
+
+    $r = null;
+
+    // [2] Défloutage best-effort au moment du téléchargement : la variante
+    // nette (même signature) est essayée en premier pour chaque média flouté.
+    if (!empty($m['blur'])) {
+        $cand = deblur_url($m['url']);
+        if ($cand !== null) {
+            $r = http_get($cand, 60);
+            if ($r['code'] === 200 && $r['body']) {
+                $m['url'] = $cand;
+                $m['blur'] = false;
+                $m['deblurred'] = true;
+                mym_persist_deblur($user, $m);
+            } else {
+                $r = null;
+            }
+        }
     }
-    $r = http_get($m['url'], 60);
-    if ($r['code'] !== 200) {
-        $m = mym_refresh_media($user, $m, true);
-        if (!$m) continue;
+
+    if ($r === null) {
+        if (mym_media_needs_refresh($m)) {
+            $m = mym_refresh_media($user, $m);
+            if (!$m) continue;
+        }
         $r = http_get($m['url'], 60);
+        if ($r['code'] !== 200) {
+            $m = mym_refresh_media($user, $m, true);
+            if (!$m) continue;
+            $r = http_get($m['url'], 60);
+        }
     }
+
     if ($r['code'] === 200 && $r['body']) {
-        $zip->addFromString(basename($m['key'] ?? ('m' . $n)), $r['body']);
+        $name = basename($m['key'] ?? ('m' . $n));
+        if (!empty($m['deblurred'])) $name = str_replace('-blur', '', $name);
+        $zip->addFromString($name, $r['body']);
         $n++;
     }
 }

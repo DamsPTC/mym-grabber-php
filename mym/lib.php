@@ -6,6 +6,8 @@ const CACHE_DIR  = __DIR__ . '/cache';
 const CACHE_TTL  = 90; // secondes avant de rafraîchir les URL
 // v3 : les caches v2 peuvent contenir des URL floutées non défloutées.
 const FEED_CACHE_VERSION = 3;
+// Défloutage : délai minimum entre deux tentatives sur un même média flouté.
+const DEBLUR_RETRY_DELAY = 45;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
 function ensure_cache_dir() { if (!is_dir(CACHE_DIR)) @mkdir(CACHE_DIR, 0775, true); }
@@ -82,38 +84,38 @@ function load_cache($user) {
 }
 
 function get_profile($user, $force = false, ?array $feed = null) {
+    $data = null;
     if (!$force) {
-        $c = load_cache($user);
-        if ($c && ($c['feed_version'] ?? 0) === FEED_CACHE_VERSION
-            && (time() - $c['fetched_at']) < CACHE_TTL) return $c;
+        $cached = load_cache($user);
+        if ($cached && ($cached['feed_version'] ?? 0) === FEED_CACHE_VERSION
+            && (time() - $cached['fetched_at']) < CACHE_TTL) $data = $cached;
     }
-    $jar = mym_cookie_jar();
-    if ($feed === null) $feed = mym_fetch_profile_feed($user, 25, $jar, $force);
-    $first = mym_fetch_profile_page($user, 1, $jar);
-    if (!$feed && $first['status'] === 404) return ['user'=>$user,'notfound'=>true,'media'=>[],'fetched_at'=>time()];
-    if (!$feed && $first['status'] !== 200)
-        return ['user'=>$user,'error'=>'HTTP '.$first['status'],'media'=>[],'fetched_at'=>time()];
+    if ($data === null) {
+        $jar = mym_cookie_jar();
+        if ($feed === null) $feed = mym_fetch_profile_feed($user, 25, $jar, $force);
+        $first = mym_fetch_profile_page($user, 1, $jar);
+        if (!$feed && $first['status'] === 404) return ['user'=>$user,'notfound'=>true,'media'=>[],'fetched_at'=>time()];
+        if (!$feed && $first['status'] !== 200)
+            return ['user'=>$user,'error'=>'HTTP '.$first['status'],'media'=>[],'fetched_at'=>time()];
 
-    $data = ['user'=>$user,'title'=>$first['title'] ?? $user,'posts'=>$first['posts'] ?? 0,
-        'media'=>$feed,'fetched_at'=>time(),'feed_loaded'=>true,'feed_version'=>FEED_CACHE_VERSION];
+        $data = ['user'=>$user,'title'=>$first['title'] ?? $user,'posts'=>$first['posts'] ?? 0,
+            'media'=>$feed,'fetched_at'=>time(),'feed_loaded'=>true,'feed_version'=>FEED_CACHE_VERSION];
+    }
 
-    // [2] Layer défloutage best-effort : pour chaque média flouté, tenter la
-    // variante non floutée (descripteur ré-encodé sans "-blur", même signature).
-    // Si la candidate répond 200, on sert la nette ; sinon on garde la floutée.
+    // [2] Défloutage best-effort CONTINU : retenté à chaque appel tant que le
+    // média reste flouté (throttle par média via deblur_tried_at). Un succès
+    // remplace l'URL et est mémorisé dans le cache du profil.
+    $updated = false;
     foreach ($data['media'] as &$x) {
-        if (!empty($x['blur'])) {
-            $c = deblur_url($x['url']);
-            if ($c !== null && mym_http_get($c)['status'] === 200) {
-                $x['url'] = $c;
-                $x['blur'] = false;
-                $x['deblurred'] = true;
-            }
-        }
+        if (!mym_deblur_due($x)) continue;
+        mym_try_deblur($x);
+        $updated = true; // deblur_tried_at évolue même en cas d'échec
     }
     unset($x);
-
-    ensure_cache_dir();
-    @file_put_contents(cache_path($user), json_encode($data), LOCK_EX);
+    if ($updated) {
+        ensure_cache_dir();
+        @file_put_contents(cache_path($user), json_encode($data), LOCK_EX);
+    }
     return $data;
 }
 
@@ -309,24 +311,100 @@ function mym_media_identity(array $item): string
     return is_string($item['key'] ?? null) ? 'key:' . $item['key'] : 'id:' . $item['id'];
 }
 
-// [2] Layer défloutage : helpers base64url + génération de la candidate nette.
+// [2] Layer défloutage continu (best-effort).
 
 function mym_b64d($s) { return base64_decode(strtr($s, '-_', '+/')); }
 function mym_b64e($s) { return rtrim(strtr(base64_encode($s), '+/', '-_'), '='); }
 
 /**
- * Variante non floutée d'une URL média (best-effort).
- * Ré-encode le descripteur base64url du chemin en retirant "-blur" de json.key,
- * et réutilise telle quelle la query string (même signature CloudFront).
- * Retourne null si l'URL ne correspond pas au format attendu ou n'est pas floutée.
+ * Variante non floutée d'une URL média, en conservant la même signature :
+ * - /medias/v2/{b64url} : retire "-blur" du descripteur DÉCODÉ puis ré-encode,
+ *   sans passer par json_decode/json_encode (préservation octet par octet
+ *   du reste du descripteur, pour ne pas casser ce que couvre la signature).
+ * - autres chemins du CDN : retire "-blur" directement du chemin.
+ * Retourne null si l'URL n'est pas floutée ou hors du CDN média.
  */
 function deblur_url(string $url): ?string
 {
-    if (!preg_match('~^(https://media\.prod-v2\.mym\.fans/medias/v2/)([^?]+)\?(.+)$~', $url, $m)) return null;
-    $json = json_decode(mym_b64d($m[2]), true);
-    if (!is_array($json) || empty($json['key']) || strpos($json['key'], '-blur') === false) return null;
-    $json['key'] = str_replace('-blur', '', $json['key']);
-    return $m[1] . mym_b64e(json_encode($json)) . '?' . $m[3];
+    if (strpos($url, MEDIA_HOST . '/') !== 0) return null;
+    $cut   = strpos($url, '?');
+    $base  = ($cut === false) ? $url : substr($url, 0, $cut);
+    $query = ($cut === false) ? '' : substr($url, $cut);
+
+    if (preg_match('~^' . preg_quote(MEDIA_HOST, '~') . '/medias/v2/([^/]+)$~', $base, $m)) {
+        $raw = mym_b64d($m[1]);
+        if ($raw === false || $raw === '' || strpos($raw, '-blur') === false) return null;
+        return MEDIA_HOST . '/medias/v2/' . mym_b64e(str_replace('-blur', '', $raw)) . $query;
+    }
+
+    if (strpos($base, '-blur') === false) return null;
+    return str_replace('-blur', '', $base) . $query;
+}
+
+/** Vérifie qu'une URL est servie (HTTP 200/206) en évitant de télécharger le corps. */
+function mym_url_reachable(string $url): bool
+{
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_NOBODY => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 3,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+        CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
+        CURLOPT_TIMEOUT => 15,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_USERAGENT => UA,
+    ]);
+    curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($code === 200) return true;
+    // Certains CDN refusent HEAD : confirmer avec un GET allégé (Range).
+    $r = mym_http_get($url, ['Range: bytes=0-0']);
+    return $r['status'] === 200 || $r['status'] === 206;
+}
+
+/** Un média flouté mérite-t-il une (nouvelle) tentative de défloutage ? */
+function mym_deblur_due(array $item): bool
+{
+    if (empty($item['blur'])) return false;
+    return (time() - (int)($item['deblur_tried_at'] ?? 0)) >= DEBLUR_RETRY_DELAY;
+}
+
+/**
+ * Tente la variante nette d'un média flouté ; marque la tentative dans l'item.
+ * Retourne true si le média est désormais servi en version nette.
+ */
+function mym_try_deblur(array &$item): bool
+{
+    $item['deblur_tried_at'] = time();
+    $candidate = deblur_url($item['url']);
+    if ($candidate === null || !mym_url_reachable($candidate)) return false;
+    $item['url'] = $candidate;
+    $item['blur'] = false;
+    $item['deblurred'] = true;
+    $item['expires_at'] = mym_signed_url_expiry($candidate);
+    return true;
+}
+
+/** Mémorise un défloutage réussi dans le cache du profil, si présent. */
+function mym_persist_deblur(string $user, array $item): void
+{
+    $prof = load_cache($user);
+    if (!is_array($prof) || !is_array($prof['media'] ?? null)) return;
+    foreach ($prof['media'] as &$m) {
+        if (($m['id'] ?? null) === $item['id']) {
+            $m['url'] = $item['url'];
+            $m['blur'] = false;
+            $m['deblurred'] = true;
+            $m['deblur_tried_at'] = time();
+            $m['expires_at'] = mym_signed_url_expiry($item['url']);
+            break;
+        }
+    }
+    unset($m);
+    @file_put_contents(cache_path($user), json_encode($prof), LOCK_EX);
 }
 
 /** Lit l'expiration annoncée, sans fabriquer ni modifier la signature. */
@@ -355,7 +433,7 @@ function mym_media_needs_refresh(array $item): bool
         || time() - ($item['url_fetched_at'] ?? 0) >= CACHE_TTL;
 }
 
-/** Lecture d'attributs HTML sans dépendance à l'extension DOM. */
+/** Lecture d'attributs HTML sans dépendre à l'extension DOM. */
 function mym_html_attributes(string $tag): array
 {
     $attributes = [];
