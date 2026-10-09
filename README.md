@@ -5,6 +5,9 @@ Webapp PHP autonome, sans Composer, à installer sur un hébergement PHP tel que
 ## Fichiers
 
 ```text
+index.php          Accueil du domaine (charge mym/index.php)
+media.php          Proxy accessible depuis l'accueil du domaine
+zip.php            Export accessible depuis l'accueil du domaine
 mym/
 ├── index.php      Interface et extraction du profil
 ├── media.php      Proxy média et rafraîchissement des URL
@@ -15,6 +18,16 @@ mym/
 ```
 
 ## Installation sur Hostinger
+
+### À la racine d'un domaine ou sous-domaine
+
+Déployer **tout le dépôt** depuis la branche `main` dans le répertoire web du domaine ou sous-domaine choisi. Les fichiers `index.php`, `media.php` et `zip.php` doivent être directement dans ce répertoire, à côté du dossier `mym/`. L'application s'ouvre alors sur `https://votre-domaine/`, sans ajouter `/mym/`.
+
+Sur un déploiement existant, cliquer sur **Déployer** dans la section Git de hPanel après avoir récupéré cette version si le déploiement automatique n'est pas configuré.
+
+Un 403 à la racine alors que `/mym/` fonctionne indique que PHP et l'application fonctionnent mais que la racine n'a pas de page d'accueil. Vérifier que le fichier `index.php` situé à la racine du dépôt a bien été déployé. Ne pas copier `mym/cache/.htaccess` à la racine : ce fichier interdit volontairement l'accès au cache uniquement.
+
+### Dans un sous-dossier `/mym/`
 
 1. Télécharger le dépôt via **Code → Download ZIP**, puis extraire l'archive.
 2. Uploader le dossier `mym/` dans `public_html/`, y compris `cache/.htaccess`.
@@ -39,13 +52,13 @@ Le dépôt GitHub conserve le code ; il n'exécute pas PHP. Le site devient acce
 
 ## Vérification
 
-Une action GitHub vérifie la syntaxe des quatre fichiers PHP après chaque push ou pull request. Cette vérification n'effectue aucune requête vers MYM et ne garantit pas la compatibilité avec son HTML actuel.
+Une action GitHub vérifie la syntaxe de tous les fichiers PHP et le rendu de l'accueil à la racine après chaque push ou pull request. Cette vérification n'effectue aucune requête vers MYM et ne garantit pas la compatibilité avec son HTML actuel.
 
 En local, avec PHP installé :
 
 ```sh
-find mym -name '*.php' -print0 | xargs -0 -n1 php -l
-php -S 127.0.0.1:8080 -t mym
+find . -name '*.php' -not -path './.git/*' -print0 | xargs -0 -n1 php -l
+php -S 127.0.0.1:8080
 ```
 
 Le serveur intégré PHP est destiné au développement.

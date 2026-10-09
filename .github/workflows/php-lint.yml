@@ -17,4 +17,9 @@ jobs:
       - name: PHP version
         run: php --version
       - name: Check PHP syntax
-        run: find mym -name '*.php' -print0 | xargs -0 -n1 php -l
+        run: find . -name '*.php' -not -path './.git/*' -print0 | xargs -0 -n1 php -l
+      - name: Check root entry point
+        run: |
+          php index.php > /tmp/mym-root.html
+          grep -Fq '<title>MYM Grabber</title>' /tmp/mym-root.html
+          grep -Fq 'name="u"' /tmp/mym-root.html
