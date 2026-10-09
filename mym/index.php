@@ -83,10 +83,10 @@ $blurred = count($media) - count($sharp);
       <?php endforeach; ?>
     </div>
     <p class="note">
-      « flouté » = aperçu gratuit d'un contenu verrouillé. Les tentatives de défloutage
-      (variante non floutée, même signature) sont retentées en continu ; quand une
-      variante répond 200, le média net est servi et mémorisé. Le proxy récupère aussi
-      une nouvelle URL signée lorsque l'ancienne expire.
+      « flouté » = aperçu gratuit d'un contenu verrouillé. Défloutage best-effort continu :
+      la variante non floutée est tentée via les cookies CloudFront (policy wildcard)
+      puis via la signature d'origine, et retentée tant qu'elle n'a pas répondu 200.
+      Le proxy récupère aussi une nouvelle URL signée lorsque l'ancienne expire.
     </p>
   <?php endif; ?>
 <?php endif; ?>

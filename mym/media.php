@@ -19,29 +19,48 @@ if (mym_media_needs_refresh($item)) {
 
 $up = null;
 
-// [2] Média encore flouté : tenter d'abord la variante nette (même signature).
-// Si elle répond 200, on la sert et on mémorise le succès dans le cache
-// pour que l'UI et le ZIP utilisent directement l'URL nette ensuite.
-if (!empty($item['blur'])) {
-    $cand = deblur_url($item['url']);
-    if ($cand !== null) {
-        $try = http_get($cand, 60);
-        if ($try['code'] === 200 && $try['body']) {
-            $item['url'] = $cand;
-            $item['blur'] = false;
-            $item['deblurred'] = true;
-            mym_persist_deblur($user, $item);
-            $up = $try;
-        }
+// [2] Média encore flouté : tenter la variante nette (cookies CloudFront en
+// priorité, puis signature). Si un essai répond 200, on sert ce corps et on
+// mémorise l'URL dans le cache pour l'UI et le ZIP.
+if (!empty($item['blur']) && mym_deblur_due($item)) {
+    $win = mym_try_deblur($item, $user, true);
+    if ($win !== null) {
+        mym_persist_deblur($user, $item);
+        $up = ['code' => 200, 'body' => $win['body']];
     }
 }
 
-// Sinon : version floutée, puis nouvelle lecture de la page d'origine si l'URL a expiré.
+// URL déjà défloutée via cookies : ceux-ci sont obligatoires pour la servir.
+if ($up === null && empty($item['blur']) && !empty($item['cf_auth'])) {
+    $t = http_get($item['url'], 60, mym_cf_jar($user));
+    if ($t['code'] === 200 && $t['body']) $up = $t;
+}
+
 if ($up === null) {
+    // Version floutée (signature seule).
     $up = http_get($item['url'], 60);
     if ($up['code'] !== 200) {
+        // Signature expirée : retenter avec les cookies seuls (sans signature).
+        $jar = mym_cf_jar($user);
+        if ($jar !== null) {
+            $t = http_get(mym_url_bare($item['url']), 60, $jar);
+            if ($t['code'] === 200 && $t['body']) $up = $t;
+        }
+    }
+    if ($up['code'] !== 200) {
+        // Nouvelle lecture de la page d'origine, puis nouvelle tentative de
+        // défloutage avec l'URL signée fraîche avant de retomber sur le flou.
         $item = mym_refresh_media($user, $item, true);
-        if ($item) $up = http_get($item['url'], 60);
+        if ($item) {
+            if (!empty($item['blur']) && mym_deblur_due($item)) {
+                $win = mym_try_deblur($item, $user, true);
+                if ($win !== null) {
+                    mym_persist_deblur($user, $item);
+                    $up = ['code' => 200, 'body' => $win['body']];
+                }
+            }
+            if (($up['code'] ?? 0) !== 200) $up = http_get($item['url'], 60);
+        }
     }
 }
 

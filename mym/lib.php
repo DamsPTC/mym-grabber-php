@@ -4,15 +4,19 @@ const MYM_HOST   = 'https://mym.fans';
 const MEDIA_HOST = 'https://media.prod-v2.mym.fans';
 const CACHE_DIR  = __DIR__ . '/cache';
 const CACHE_TTL  = 90; // secondes avant de rafraîchir les URL
-// v3 : les caches v2 peuvent contenir des URL floutées non défloutées.
-const FEED_CACHE_VERSION = 3;
-// Défloutage : délai minimum entre deux tentatives sur un même média flouté.
+// v4 : caches v3 sans cf_auth (cookies CloudFront du layer défloutage).
+const FEED_CACHE_VERSION = 4;
+// Défloutage : délai minimum entre deux tentatives sur un même média flouté,
+// et nombre maximum de tentatives par passage de get_profile().
 const DEBLUR_RETRY_DELAY = 45;
+const DEBLUR_MAX_PER_PASS = 10;
+// Cookies CloudFront : rafraîchis au maximum toutes les 30 minutes.
+const CF_COOKIE_TTL = 1800;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
 function ensure_cache_dir() { if (!is_dir(CACHE_DIR)) @mkdir(CACHE_DIR, 0775, true); }
 
-function http_get($url, $timeout = 30) {
+function http_get($url, $timeout = 30, $jar = null) {
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
@@ -24,6 +28,11 @@ function http_get($url, $timeout = 30) {
         CURLOPT_ENCODING       => '',
         CURLOPT_HTTPHEADER     => ['Accept-Language: fr,en;q=0.8'],
     ]);
+    if ($jar !== null) {
+        // Cookies CloudFront éventuels (policy wildcard) pour l'accès média.
+        curl_setopt($ch, CURLOPT_COOKIEJAR, $jar);
+        curl_setopt($ch, CURLOPT_COOKIEFILE, $jar);
+    }
     $body = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $err  = curl_error($ch);
@@ -102,17 +111,19 @@ function get_profile($user, $force = false, ?array $feed = null) {
             'media'=>$feed,'fetched_at'=>time(),'feed_loaded'=>true,'feed_version'=>FEED_CACHE_VERSION];
     }
 
-    // [2] Défloutage best-effort CONTINU : retenté à chaque appel tant que le
-    // média reste flouté (throttle par média via deblur_tried_at). Un succès
-    // remplace l'URL et est mémorisé dans le cache du profil.
-    $updated = false;
-    foreach ($data['media'] as &$x) {
-        if (!mym_deblur_due($x)) continue;
-        mym_try_deblur($x);
-        $updated = true; // deblur_tried_at évolue même en cas d'échec
+    // [2] Défloutage best-effort CONTINU, cookies CloudFront en priorité :
+    // retenté à chaque appel tant que le média reste flouté (throttle par média
+    // via deblur_tried_at, quota par passage avec rotation des moins récemment
+    // tentés). Un succès remplace l'URL et est mémorisé dans le cache.
+    $due = [];
+    foreach ($data['media'] as $k => $x) {
+        if (mym_deblur_due($x)) $due[$k] = (int)($x['deblur_tried_at'] ?? 0);
     }
-    unset($x);
-    if ($updated) {
+    if ($due) {
+        asort($due);
+        foreach (array_slice($due, 0, DEBLUR_MAX_PER_PASS, true) as $k => $t) {
+            mym_try_deblur($data['media'][$k], $user);
+        }
         ensure_cache_dir();
         @file_put_contents(cache_path($user), json_encode($data), LOCK_EX);
     }
@@ -238,6 +249,70 @@ function mym_cookie_jar(): ?string
     return $jar = $path;
 }
 
+// ---- Cookies CloudFront signés (vecteur du défloutage) ----
+
+/** URL sans la query de signature (accès par cookies uniquement). */
+function mym_url_bare(string $url): string
+{
+    $cut = strpos($url, '?');
+    return $cut === false ? $url : substr($url, 0, $cut);
+}
+
+function mym_cf_jar_path(): string { return CACHE_DIR . '/cookies/cf.jar'; }
+
+/** Le jar contient-il une policy CloudFront signée ? */
+function mym_jar_has_cloudfront_policy(string $jar): bool
+{
+    $lines = @file($jar);
+    if (!is_array($lines)) return false;
+    foreach ($lines as $line) {
+        $line = rtrim($line, "\r\n");
+        if ($line === '' || $line[0] === '#') continue;
+        $parts = preg_split('~\t~', $line);
+        if (count($parts) >= 7 && $parts[5] === 'CloudFront-Policy') return true;
+    }
+    return false;
+}
+
+/** Visite les pages publiques pour collecter/rafraîchir les cookies CloudFront. */
+function mym_cf_refresh_cookies(?string $creator = null): void
+{
+    $path = mym_cf_jar_path();
+    $directory = dirname($path);
+    if (!is_dir($directory) && !@mkdir($directory, 0700, true) && !is_dir($directory)) return;
+    @chmod($directory, 0700);
+    $targets = [MYM_HOST . '/'];
+    if ($creator !== null && $creator !== '') $targets[] = MYM_HOST . '/' . rawurlencode($creator);
+    foreach ($targets as $url) mym_http_get($url, ['Accept: text/html'], $path);
+    if (is_file($path)) @chmod($path, 0600);
+}
+
+/**
+ * Jar de cookies CloudFront à joindre aux requêtes média.
+ * Priorité : session fan si elle porte déjà la policy (accès le plus large),
+ * sinon jar anonyme rafraîchi toutes les CF_COOKIE_TTL secondes en visitant
+ * la page du profil et la page d'accueil. Null si aucune policy capturée.
+ */
+function mym_cf_jar(?string $creator = null): ?string
+{
+    static $resolved = false;
+    static $jar = null;
+    if ($resolved) return $jar;
+    $resolved = true;
+
+    $fan = mym_cookie_jar();
+    if (is_string($fan) && mym_jar_has_cloudfront_policy($fan)) return $jar = $fan;
+
+    $path = mym_cf_jar_path();
+    if (!is_file($path) || filesize($path) === 0
+        || (time() - (int)@filemtime($path)) > CF_COOKIE_TTL
+        || !mym_jar_has_cloudfront_policy($path)) {
+        mym_cf_refresh_cookies($creator);
+    }
+    if (is_file($path) && mym_jar_has_cloudfront_policy($path)) return $jar = $path;
+    return $jar = null;
+}
+
 /** Extrait HTML/JSON et conserve le format attendu par find_media(). */
 function mym_parse_media_from_feed(string $body): array
 {
@@ -311,7 +386,7 @@ function mym_media_identity(array $item): string
     return is_string($item['key'] ?? null) ? 'key:' . $item['key'] : 'id:' . $item['id'];
 }
 
-// [2] Layer défloutage continu (best-effort).
+// [2] Layer défloutage continu (best-effort), via cookies CloudFront.
 
 function mym_b64d($s) { return base64_decode(strtr($s, '-_', '+/')); }
 function mym_b64e($s) { return rtrim(strtr(base64_encode($s), '+/', '-_'), '='); }
@@ -342,7 +417,7 @@ function deblur_url(string $url): ?string
 }
 
 /** Vérifie qu'une URL est servie (HTTP 200/206) en évitant de télécharger le corps. */
-function mym_url_reachable(string $url): bool
+function mym_url_reachable(string $url, ?string $jar = null): bool
 {
     $ch = curl_init($url);
     curl_setopt_array($ch, [
@@ -356,12 +431,16 @@ function mym_url_reachable(string $url): bool
         CURLOPT_CONNECTTIMEOUT => 10,
         CURLOPT_USERAGENT => UA,
     ]);
+    if ($jar !== null) {
+        curl_setopt($ch, CURLOPT_COOKIEJAR, $jar);
+        curl_setopt($ch, CURLOPT_COOKIEFILE, $jar);
+    }
     curl_exec($ch);
     $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
     if ($code === 200) return true;
     // Certains CDN refusent HEAD : confirmer avec un GET allégé (Range).
-    $r = mym_http_get($url, ['Range: bytes=0-0']);
+    $r = mym_http_get($url, ['Range: bytes=0-0'], $jar);
     return $r['status'] === 200 || $r['status'] === 206;
 }
 
@@ -373,19 +452,55 @@ function mym_deblur_due(array $item): bool
 }
 
 /**
- * Tente la variante nette d'un média flouté ; marque la tentative dans l'item.
- * Retourne true si le média est désormais servi en version nette.
+ * Essaie la variante nette d'un média flouté, dans l'ordre :
+ *  1. URL nette SANS signature + cookies CloudFront (policy wildcard) ;
+ *  2. URL nette AVEC signature d'origine + cookies CloudFront ;
+ *  3. URL nette AVEC signature seule (historique).
+ * Retourne ['url', 'cf_auth', 'body'] au premier essai qui répond 200
+ * (corps rempli si $withBody), sinon null.
  */
-function mym_try_deblur(array &$item): bool
+function mym_deblur_attempt(string $creator, array $item, bool $withBody = false): ?array
+{
+    $candidate = deblur_url($item['url']);
+    if ($candidate === null) return null;
+
+    $jar = mym_cf_jar($creator);
+    $attempts = [];
+    if ($jar !== null) {
+        $attempts[] = [mym_url_bare($candidate), $jar];
+        $attempts[] = [$candidate, $jar];
+    }
+    $attempts[] = [$candidate, null];
+
+    foreach ($attempts as [$url, $cookieJar]) {
+        if ($withBody) {
+            $r = http_get($url, 60, $cookieJar);
+            if ($r['code'] === 200 && $r['body'] !== '') {
+                return ['url' => $url, 'cf_auth' => ($cookieJar !== null), 'body' => $r['body']];
+            }
+        } elseif (mym_url_reachable($url, $cookieJar)) {
+            return ['url' => $url, 'cf_auth' => ($cookieJar !== null), 'body' => null];
+        }
+    }
+    return null;
+}
+
+/**
+ * Tente la variante nette d'un média flouté ; marque la tentative dans l'item.
+ * Retourne le résultat de mym_deblur_attempt (null = encore flouté).
+ */
+function mym_try_deblur(array &$item, string $creator, bool $withBody = false): ?array
 {
     $item['deblur_tried_at'] = time();
-    $candidate = deblur_url($item['url']);
-    if ($candidate === null || !mym_url_reachable($candidate)) return false;
-    $item['url'] = $candidate;
+    $win = mym_deblur_attempt($creator, $item, $withBody);
+    if ($win === null) return null;
+    $item['url'] = $win['url'];
     $item['blur'] = false;
     $item['deblurred'] = true;
-    $item['expires_at'] = mym_signed_url_expiry($candidate);
-    return true;
+    $item['cf_auth'] = $win['cf_auth'];
+    $item['url_fetched_at'] = time();
+    $item['expires_at'] = mym_signed_url_expiry($win['url']);
+    return $win;
 }
 
 /** Mémorise un défloutage réussi dans le cache du profil, si présent. */
@@ -398,7 +513,9 @@ function mym_persist_deblur(string $user, array $item): void
             $m['url'] = $item['url'];
             $m['blur'] = false;
             $m['deblurred'] = true;
+            $m['cf_auth'] = !empty($item['cf_auth']);
             $m['deblur_tried_at'] = time();
+            $m['url_fetched_at'] = time();
             $m['expires_at'] = mym_signed_url_expiry($item['url']);
             break;
         }
@@ -433,7 +550,7 @@ function mym_media_needs_refresh(array $item): bool
         || time() - ($item['url_fetched_at'] ?? 0) >= CACHE_TTL;
 }
 
-/** Lecture d'attributs HTML sans dépendre à l'extension DOM. */
+/** Lecture d'attributs HTML sans dépendance à l'extension DOM. */
 function mym_html_attributes(string $tag): array
 {
     $attributes = [];
