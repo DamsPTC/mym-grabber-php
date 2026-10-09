@@ -35,17 +35,21 @@ Un 403 à la racine alors que `/mym/` fonctionne indique que PHP et l'applicatio
 4. Donner au processus PHP le droit d'écrire dans `mym/cache/` (permissions 755 ou 775 selon la configuration ; ne pas utiliser 777).
 5. Ouvrir `https://votre-domaine/mym/`, puis saisir un pseudo.
 
-Le dépôt GitHub conserve le code ; il n'exécute pas PHP. Le site devient accessible après installation sur l'hébergement PHP. Aucun déploiement Hostinger automatique n'est configuré.
+Le dépôt GitHub conserve le code ; PHP s'exécute sur Hostinger. Le sous-domaine existant récupère les mises à jour de `main` via son déploiement Git. Pour une nouvelle installation, configurer ce déploiement dans hPanel.
 
 ## Fonctionnement et limites
 
-- Le cache du profil dure 90 secondes. Les JSON générés ne sont pas versionnés.
-- Le proxy ne **signe pas** lui-même les URL : il relit la page publique et réutilise une URL fournie par MYM. La nouvelle tentative fonctionne uniquement si le même identifiant de média est encore présent et accessible.
+- La collecte parcourt le profil avec `?page=1`, `?page=2`, etc., jusqu'à une page vide, une page sans nouveau média ou la limite de 25 pages. Elle ne dépend plus de l'ancien endpoint AJAX `/feed`.
+- Seuls les `img.media__image` et les sources vidéo situés dans une grille `medias-grid` sont retenus. Avatars, images hors grille et copies présentes dans les scripts sont exclus. Les doublons sont fusionnés par clé de fichier, en conservant les variantes floutées distinctes.
+- Le catalogue est conservé 90 secondes. Chaque page dispose aussi d'un cache de 30 secondes au maximum sous `mym/cache/pages/`. Les JSON générés ne sont pas versionnés.
+- Le proxy ne **signe pas** lui-même les URL : il relit la page d'origine et réutilise une URL fournie par MYM. L'expiration est lue dans `Expires` ou dans la politique CloudFront `DateLessThan`, avec une marge de 10 secondes. Un échec du téléchargement déclenche une nouvelle tentative après rafraîchissement de cette page.
+- Chaque média conserve sa page d'origine. Si les nouvelles publications l'ont déplacé, un nouveau parcours du profil le recherche par sa clé stable.
 - Il ne peut donc pas garantir des liens permanents. Un média supprimé, un profil devenu privé ou un changement de structure HTML peuvent empêcher l'accès.
-- Seuls les médias présents dans le HTML initial sont extraits. Il n'y a pas de pagination ni de connexion à une API authentifiée.
 - Les aperçus floutés restent floutés. Le code ne modifie pas les chemins de fichiers pour rechercher une version verrouillée.
+- Le flag `blur` décrit le nom de fichier exposé, y compris quand il est encodé dans le descripteur CDN. Un aperçu sans `-blur` ne prouve pas qu'il s'agit du fichier original ou d'une vidéo complète.
+- Une session facultative peut être réutilisée depuis `mym/cache/cookies/mym_fan.jar`. Pour la connexion initiale, configurer `MYM_EMAIL` et `MYM_PASSWORD` dans l'environnement serveur. Aucun identifiant n'est inscrit dans le dépôt. Seuls les médias effectivement exposés par les pages accessibles à cette session sont collectés.
 - La grille du code fourni utilise des images pour les aperçus ; un fichier vidéo direct peut ne pas avoir de vignette affichable.
-- L'export ZIP ignore les miniatures, s'arrête à 120 téléchargements réussis et dépend des limites mémoire/durée de l'hébergeur. Il ne réessaie pas les URL expirées pendant l'export.
+- L'export ZIP ignore les miniatures, s'arrête à 120 téléchargements réussis et dépend des limites mémoire/durée de l'hébergeur. Il utilise le même rafraîchissement par page et réessaie une fois les URL refusées.
 - Le code charge chaque média en mémoire et ne gère pas les requêtes HTTP Range. Les fichiers volumineux et la navigation dans les vidéos peuvent être limités.
 - Le bouton Rafraîchir recharge la page et réutilise le cache tant que ses 90 secondes ne sont pas écoulées.
 - Sur Nginx, prévoir une règle serveur interdisant l'accès à `/mym/cache/` : `.htaccess` n'y est pas interprété.

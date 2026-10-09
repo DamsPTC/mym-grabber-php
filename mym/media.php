@@ -6,22 +6,22 @@ $id   = (string)($_GET['id'] ?? '');
 $dl   = isset($_GET['dl']);
 if ($user === '' || $id === '') { http_response_code(400); exit('Bad request'); }
 
-// Réutiliser le cache pour ne pas paginer à nouveau pour chaque vignette.
-$cached = load_cache($user);
-$mediaList = null;
-if (!$cached || empty($cached['feed_loaded']) || (time() - $cached['fetched_at']) >= CACHE_TTL) {
-    $mediaList = mym_fetch_profile_feed($user, 25, mym_cookie_jar());
-}
-$prof = get_profile($user, false, $mediaList);
+// Un ancien catalogue conserve la page d'origine ; seules ses URL sont rafraîchies.
+$prof = load_cache($user);
+if (!$prof || ($prof['feed_version'] ?? 0) !== FEED_CACHE_VERSION) $prof = get_profile($user);
 $item = find_media($prof, $id);
 if (!$item) { $prof = get_profile($user, true); $item = find_media($prof, $id); }
 if (!$item) { http_response_code(404); exit('Media introuvable'); }
 
-// 1er essai, puis nouvelle lecture du profil si l'URL a expiré
+if (mym_media_needs_refresh($item)) {
+    $item = mym_refresh_media($user, $item);
+    if (!$item) { http_response_code(404); exit('Media indisponible sur le profil'); }
+}
+
+// 1er essai, puis nouvelle lecture de la page d'origine si l'URL a expiré.
 $up = http_get($item['url'], 60);
 if ($up['code'] !== 200) {
-    $prof = get_profile($user, true);
-    $item = find_media($prof, $id);
+    $item = mym_refresh_media($user, $item, true);
     if ($item) $up = http_get($item['url'], 60);
 }
 if ($up['code'] !== 200 || !$up['body']) { http_response_code(502); exit('Upstream '.$up['code']); }

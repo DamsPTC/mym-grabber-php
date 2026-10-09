@@ -4,6 +4,7 @@ const MYM_HOST   = 'https://mym.fans';
 const MEDIA_HOST = 'https://media.prod-v2.mym.fans';
 const CACHE_DIR  = __DIR__ . '/cache';
 const CACHE_TTL  = 90; // secondes avant de rafraîchir les URL
+const FEED_CACHE_VERSION = 2;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
 function ensure_cache_dir() { if (!is_dir(CACHE_DIR)) @mkdir(CACHE_DIR, 0775, true); }
@@ -82,28 +83,18 @@ function load_cache($user) {
 function get_profile($user, $force = false, ?array $feed = null) {
     if (!$force) {
         $c = load_cache($user);
-        if ($c && !empty($c['feed_loaded']) && (time() - $c['fetched_at']) < CACHE_TTL) return $c;
+        if ($c && ($c['feed_version'] ?? 0) === FEED_CACHE_VERSION
+            && (time() - $c['fetched_at']) < CACHE_TTL) return $c;
     }
-    // Les appels existants avec $force=true rafraîchissent aussi le feed.
-    // Une liste fournie par media.php évite un deuxième parcours des pages.
-    if ($feed === null) $feed = mym_fetch_profile_feed($user, 25, mym_cookie_jar());
-    $r = http_get(MYM_HOST . '/' . rawurlencode($user));
-    if (!$feed && $r['code'] === 404) return ['user'=>$user,'notfound'=>true,'media'=>[],'fetched_at'=>time()];
-    if (!$feed && ($r['code'] !== 200 || !$r['body']))
-        return ['user'=>$user,'error'=>'HTTP '.$r['code'].' '.$r['error'],'media'=>[],'fetched_at'=>time()];
+    $jar = mym_cookie_jar();
+    if ($feed === null) $feed = mym_fetch_profile_feed($user, 25, $jar, $force);
+    $first = mym_fetch_profile_page($user, 1, $jar);
+    if (!$feed && $first['status'] === 404) return ['user'=>$user,'notfound'=>true,'media'=>[],'fetched_at'=>time()];
+    if (!$feed && $first['status'] !== 200)
+        return ['user'=>$user,'error'=>'HTTP '.$first['status'],'media'=>[],'fetched_at'=>time()];
 
-    $html  = $r['code'] === 200 ? (string)$r['body'] : '';
-    $media = extract_media($html);
-    $byId = [];
-    foreach ($media as $item) $byId[$item['id']] = $item;
-    foreach ($feed as $item) $byId[$item['id']] = $item;
-    $media = array_values($byId);
-    $posts = 0;
-    if (preg_match('~(\d[\d\s]*)\s*Posts?~i', $html, $mm)) $posts = (int)preg_replace('~\D~', '', $mm[1]);
-    $title = $user;
-    if (preg_match('~<title>(.*?)</title>~is', $html, $tt)) $title = trim(html_entity_decode($tt[1], ENT_QUOTES));
-
-    $data = ['user'=>$user,'title'=>$title,'posts'=>$posts,'media'=>$media,'fetched_at'=>time(),'feed_loaded'=>true];
+    $data = ['user'=>$user,'title'=>$first['title'] ?? $user,'posts'=>$first['posts'] ?? 0,
+        'media'=>$feed,'fetched_at'=>time(),'feed_loaded'=>true,'feed_version'=>FEED_CACHE_VERSION];
     ensure_cache_dir();
     @file_put_contents(cache_path($user), json_encode($data), LOCK_EX);
     return $data;
@@ -111,6 +102,11 @@ function get_profile($user, $force = false, ?array $feed = null) {
 
 function find_media($prof, $id) {
     foreach ($prof['media'] as $m) if ($m['id'] === $id) return $m;
+    // Un descripteur CDN peut changer ; retrouver uniquement une clé déjà exposée.
+    $key = decode_key($id);
+    if (is_string($key)) {
+        foreach ($prof['media'] as $m) if (($m['key'] ?? null) === $key) return $m;
+    }
     return null;
 }
 
@@ -269,33 +265,156 @@ function mym_parse_media_from_feed(string $body): array
 }
 
 /**
- * Parcourt les pages accessibles à la session, dans la limite de $maxPages.
+ * Parcourt les pages HTML du profil, dans la limite de $maxPages.
  * Les URL sont utilisées telles que reçues ; aucune transformation du flou.
  */
-function mym_fetch_profile_feed(string $creator, int $maxPages = 25, ?string $cookieJar = null): array
+function mym_fetch_profile_feed(string $creator, int $maxPages = 25, ?string $cookieJar = null, bool $force = false): array
 {
-    $base = MYM_HOST . '/app/ajax/profile/' . rawurlencode($creator) . '/feed';
-    $headers = [
-        'X-Requested-With: XMLHttpRequest',
-        'Accept: application/json, text/javascript, */*; q=0.01',
-        'Referer: ' . MYM_HOST . '/' . rawurlencode($creator),
-    ];
     $items = [];
     for ($page = 1; $page <= $maxPages; $page++) {
-        $url = $base . '?page=' . $page . '&sort=date_desc&media_type=all';
-        $response = mym_http_get($url, $headers, $cookieJar);
-        if ($response['status'] !== 200
-            || parse_url($response['url'], PHP_URL_HOST) !== parse_url(MYM_HOST, PHP_URL_HOST)
-            || parse_url($response['url'], PHP_URL_PATH) !== parse_url($base, PHP_URL_PATH)) break;
-        $found = mym_parse_media_from_feed($response['body']);
+        $response = mym_fetch_profile_page($creator, $page, $cookieJar, $force);
+        if ($response['status'] !== 200) break;
+        $found = $response['media'];
         if (!$found) break;
         $added = 0;
         foreach ($found as $item) {
-            if (!isset($items[$item['id']])) $added++;
-            $items[$item['id']] = $item;
+            $identity = mym_media_identity($item);
+            if (!isset($items[$identity])) { $items[$identity] = $item; $added++; }
         }
         // Certains endpoints répètent la dernière page au lieu d'en renvoyer une vide.
         if ($added === 0) break;
     }
     return array_values($items);
+}
+
+function mym_media_identity(array $item): string
+{
+    return is_string($item['key'] ?? null) ? 'key:' . $item['key'] : 'id:' . $item['id'];
+}
+
+/** Lit l'expiration annoncée, sans fabriquer ni modifier la signature. */
+function mym_signed_url_expiry(string $url): ?int
+{
+    parse_str((string)parse_url($url, PHP_URL_QUERY), $query);
+    if (isset($query['Expires']) && is_scalar($query['Expires']) && ctype_digit((string)$query['Expires'])) {
+        return (int)$query['Expires'];
+    }
+    if (!isset($query['Policy']) || !is_string($query['Policy'])) return null;
+    $raw = base64_decode(strtr($query['Policy'], ['-'=>'+', '_'=>'=', '~'=>'/']), true);
+    if ($raw === false) return null;
+    $policy = json_decode($raw, true);
+    $times = [];
+    foreach (($policy['Statement'] ?? []) as $statement) {
+        $expiry = $statement['Condition']['DateLessThan']['AWS:EpochTime'] ?? null;
+        if (is_numeric($expiry)) $times[] = (int)$expiry;
+    }
+    return $times ? min($times) : null;
+}
+
+function mym_media_needs_refresh(array $item): bool
+{
+    $expiry = $item['expires_at'] ?? mym_signed_url_expiry($item['url']);
+    return ($expiry !== null && $expiry <= time() + 10)
+        || time() - ($item['url_fetched_at'] ?? 0) >= CACHE_TTL;
+}
+
+/** Lecture d'attributs HTML sans dépendance à l'extension DOM. */
+function mym_html_attributes(string $tag): array
+{
+    $attributes = [];
+    preg_match_all('~([a-zA-Z_:][a-zA-Z0-9_:.-]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+))~s', $tag, $matches, PREG_SET_ORDER);
+    foreach ($matches as $match) {
+        $value = $match[2] !== '' ? $match[2] : (($match[3] ?? '') !== '' ? $match[3] : ($match[4] ?? ''));
+        $attributes[strtolower($match[1])] = html_entity_decode($value, ENT_QUOTES, 'UTF-8');
+    }
+    return $attributes;
+}
+
+/** Uniquement les médias de la grille : exclut avatar, couverture et scripts. */
+function mym_parse_profile_media(string $html, int $page): array
+{
+    $html = preg_replace('~<!--.*?-->|<(script|style)\b[^>]*>.*?</\1\s*>~is', '', $html);
+    preg_match_all('~</?(?:div|img|video|source)\b[^>]*>~i', $html, $matches);
+    $depth = 0;
+    $grids = [];
+    $sources = [];
+    foreach ($matches[0] as $tag) {
+        if (preg_match('~^</div\b~i', $tag)) {
+            if ($grids && end($grids) === $depth) array_pop($grids);
+            $depth = max(0, $depth - 1);
+            continue;
+        }
+        $attributes = mym_html_attributes($tag);
+        $classes = ' ' . preg_replace('~\s+~', ' ', $attributes['class'] ?? '') . ' ';
+        if (preg_match('~^<div\b~i', $tag)) {
+            $depth++;
+            if (strpos($classes, ' medias-grid ') !== false) $grids[] = $depth;
+            continue;
+        }
+        if (!$grids) continue;
+        if (preg_match('~^<img\b~i', $tag) && strpos($classes, ' media__image ') === false) continue;
+        foreach (['data-src', 'src'] as $attribute) {
+            $url = $attributes[$attribute] ?? '';
+            if (strpos($url, MEDIA_HOST . '/') === 0) { $sources[] = $url; break; }
+        }
+    }
+    $items = [];
+    foreach (mym_parse_media_from_feed(implode("\n", $sources)) as $item) {
+        $item['source_page'] = $page;
+        $item['url_fetched_at'] = time();
+        $item['expires_at'] = mym_signed_url_expiry($item['url']);
+        $items[mym_media_identity($item)] = $item;
+    }
+    return array_values($items);
+}
+
+/** Cache court par page pour partager les nouvelles URL entre les téléchargements. */
+function mym_fetch_profile_page(string $creator, int $page, ?string $cookieJar = null, bool $force = false): array
+{
+    $page = max(1, $page);
+    $directory = CACHE_DIR . '/pages';
+    $path = $directory . '/' . md5(strtolower($creator)) . '-' . $page . '.json';
+    if (!$force && is_file($path)) {
+        $cached = json_decode((string)file_get_contents($path), true);
+        if (is_array($cached) && ($cached['feed_version'] ?? 0) === FEED_CACHE_VERSION
+            && time() - ($cached['fetched_at'] ?? 0) < min(CACHE_TTL, 30)) {
+            $fresh = true;
+            foreach ($cached['media'] as $item) if (mym_media_needs_refresh($item)) { $fresh = false; break; }
+            if ($fresh) return $cached;
+        }
+    }
+    $base = MYM_HOST . '/' . rawurlencode($creator);
+    $response = mym_http_get($base . '?page=' . $page, ['Accept: text/html', 'Referer: ' . $base], $cookieJar);
+    $status = $response['status'];
+    if ($status === 200 && (parse_url($response['url'], PHP_URL_HOST) !== parse_url(MYM_HOST, PHP_URL_HOST)
+        || rtrim((string)parse_url($response['url'], PHP_URL_PATH), '/') !== '/' . rawurlencode($creator))) $status = 403;
+    $data = ['status'=>$status,'user'=>$creator,'page'=>$page,'media'=>[],
+        'title'=>$creator,'posts'=>0,'fetched_at'=>time(),'feed_version'=>FEED_CACHE_VERSION];
+    if ($status !== 200) return $data;
+    $data['media'] = mym_parse_profile_media($response['body'], $page);
+    if (preg_match('~<title>(.*?)</title>~is', $response['body'], $title))
+        $data['title'] = trim(html_entity_decode($title[1], ENT_QUOTES, 'UTF-8'));
+    $text = html_entity_decode(strip_tags($response['body']), ENT_QUOTES, 'UTF-8');
+    if (preg_match('~(\d[\d\s\x{00a0}\x{202f}]*)\s*(?:Posts?|Publications?)\b~iu', $text, $posts))
+        $data['posts'] = (int)preg_replace('~\D~', '', $posts[1]);
+    ensure_cache_dir();
+    if (is_dir($directory) || @mkdir($directory, 0775, true) || is_dir($directory))
+        @file_put_contents($path, json_encode($data), LOCK_EX);
+    return $data;
+}
+
+/** Relire d'abord la page d'origine ; parcourir le profil seulement si le média a changé de page. */
+function mym_refresh_media(string $creator, array $item, bool $force = false): ?array
+{
+    $page = (int)($item['source_page'] ?? 0);
+    if ($page > 0) {
+        $result = mym_fetch_profile_page($creator, $page, mym_cookie_jar(), $force);
+        if ($result['status'] !== 200) return null;
+        $identity = mym_media_identity($item);
+        foreach ($result['media'] as $candidate) {
+            if (mym_media_identity($candidate) === $identity) return $candidate;
+        }
+    }
+    $profile = get_profile($creator, true);
+    return find_media($profile, $item['id']);
 }

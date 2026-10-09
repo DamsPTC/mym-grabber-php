@@ -14,7 +14,16 @@ $n = 0;
 foreach ($prof['media'] as $m) {
     if ($m['thumb']) continue;          // on saute les miniatures
     if ($n >= 120) break;
+    if (mym_media_needs_refresh($m)) {
+        $m = mym_refresh_media($user, $m);
+        if (!$m) continue;
+    }
     $r = http_get($m['url'], 60);
+    if ($r['code'] !== 200) {
+        $m = mym_refresh_media($user, $m, true);
+        if (!$m) continue;
+        $r = http_get($m['url'], 60);
+    }
     if ($r['code'] === 200 && $r['body']) {
         $zip->addFromString(basename($m['key'] ?? ('m' . $n)), $r['body']);
         $n++;
