@@ -6,7 +6,13 @@ $id   = (string)($_GET['id'] ?? '');
 $dl   = isset($_GET['dl']);
 if ($user === '' || $id === '') { http_response_code(400); exit('Bad request'); }
 
-$prof = get_profile($user);
+// Réutiliser le cache pour ne pas paginer à nouveau pour chaque vignette.
+$cached = load_cache($user);
+$mediaList = null;
+if (!$cached || empty($cached['feed_loaded']) || (time() - $cached['fetched_at']) >= CACHE_TTL) {
+    $mediaList = mym_fetch_profile_feed($user, 25, mym_cookie_jar());
+}
+$prof = get_profile($user, false, $mediaList);
 $item = find_media($prof, $id);
 if (!$item) { $prof = get_profile($user, true); $item = find_media($prof, $id); }
 if (!$item) { http_response_code(404); exit('Media introuvable'); }
