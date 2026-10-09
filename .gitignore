@@ -1,0 +1,6 @@
+/mym/cache/*
+!/mym/cache/.htaccess
+.env
+.env.*
+*.log
+.DS_Store
