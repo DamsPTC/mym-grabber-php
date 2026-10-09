@@ -4,7 +4,8 @@ const MYM_HOST   = 'https://mym.fans';
 const MEDIA_HOST = 'https://media.prod-v2.mym.fans';
 const CACHE_DIR  = __DIR__ . '/cache';
 const CACHE_TTL  = 90; // secondes avant de rafraîchir les URL
-const FEED_CACHE_VERSION = 2;
+// v3 : les caches v2 peuvent contenir des URL floutées non défloutées.
+const FEED_CACHE_VERSION = 3;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
 function ensure_cache_dir() { if (!is_dir(CACHE_DIR)) @mkdir(CACHE_DIR, 0775, true); }
@@ -95,6 +96,22 @@ function get_profile($user, $force = false, ?array $feed = null) {
 
     $data = ['user'=>$user,'title'=>$first['title'] ?? $user,'posts'=>$first['posts'] ?? 0,
         'media'=>$feed,'fetched_at'=>time(),'feed_loaded'=>true,'feed_version'=>FEED_CACHE_VERSION];
+
+    // [2] Layer défloutage best-effort : pour chaque média flouté, tenter la
+    // variante non floutée (descripteur ré-encodé sans "-blur", même signature).
+    // Si la candidate répond 200, on sert la nette ; sinon on garde la floutée.
+    foreach ($data['media'] as &$x) {
+        if (!empty($x['blur'])) {
+            $c = deblur_url($x['url']);
+            if ($c !== null && mym_http_get($c)['status'] === 200) {
+                $x['url'] = $c;
+                $x['blur'] = false;
+                $x['deblurred'] = true;
+            }
+        }
+    }
+    unset($x);
+
     ensure_cache_dir();
     @file_put_contents(cache_path($user), json_encode($data), LOCK_EX);
     return $data;
@@ -290,6 +307,26 @@ function mym_fetch_profile_feed(string $creator, int $maxPages = 25, ?string $co
 function mym_media_identity(array $item): string
 {
     return is_string($item['key'] ?? null) ? 'key:' . $item['key'] : 'id:' . $item['id'];
+}
+
+// [2] Layer défloutage : helpers base64url + génération de la candidate nette.
+
+function mym_b64d($s) { return base64_decode(strtr($s, '-_', '+/')); }
+function mym_b64e($s) { return rtrim(strtr(base64_encode($s), '+/', '-_'), '='); }
+
+/**
+ * Variante non floutée d'une URL média (best-effort).
+ * Ré-encode le descripteur base64url du chemin en retirant "-blur" de json.key,
+ * et réutilise telle quelle la query string (même signature CloudFront).
+ * Retourne null si l'URL ne correspond pas au format attendu ou n'est pas floutée.
+ */
+function deblur_url(string $url): ?string
+{
+    if (!preg_match('~^(https://media\.prod-v2\.mym\.fans/medias/v2/)([^?]+)\?(.+)$~', $url, $m)) return null;
+    $json = json_decode(mym_b64d($m[2]), true);
+    if (!is_array($json) || empty($json['key']) || strpos($json['key'], '-blur') === false) return null;
+    $json['key'] = str_replace('-blur', '', $json['key']);
+    return $m[1] . mym_b64e(json_encode($json)) . '?' . $m[3];
 }
 
 /** Lit l'expiration annoncée, sans fabriquer ni modifier la signature. */

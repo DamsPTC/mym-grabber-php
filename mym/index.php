@@ -5,6 +5,8 @@ $prof  = $user !== '' ? get_profile($user) : null;
 $media = $prof['media'] ?? [];
 $photos = array_filter($media, fn($m) => !$m['thumb']);
 $thumbs = array_filter($media, fn($m) => $m['thumb']);
+$sharp   = array_filter($media, fn($m) => empty($m['blur']));
+$blurred = count($media) - count($sharp);
 ?>
 <!doctype html>
 <html lang="fr">
@@ -52,7 +54,9 @@ $thumbs = array_filter($media, fn($m) => $m['thumb']);
   <div class="bar">
     <div class="meta">
       <b><?= htmlspecialchars($prof['title']) ?></b> — <?= (int)$prof['posts'] ?> posts ·
-      <?= count($photos) ?> médias · <?= count($thumbs) ?> vidéos
+      <?= count($photos) ?> médias · <?= count($thumbs) ?> vidéos ·
+      <span title="Médias non floutés">✔ <?= count($sharp) ?> nets</span> ·
+      <span title="Médias encore floutés">░ <?= $blurred ?> floutés</span>
     </div>
     <div>
       <a class="btn" href="?u=<?= urlencode($user) ?>">↻ Rafraîchir</a>
@@ -78,8 +82,9 @@ $thumbs = array_filter($media, fn($m) => $m['thumb']);
       <?php endforeach; ?>
     </div>
     <p class="note">
-      « flouté » = aperçu gratuit d'un contenu verrouillé. Le proxy tente de récupérer une nouvelle URL
-      lorsque l'ancienne expire, tant que le média reste disponible sur le profil public.
+      « flouté » = aperçu gratuit d'un contenu verrouillé. Quand c'est possible, la version non
+      floutée est servie automatiquement (défloutage best-effort). Le proxy tente de récupérer une
+      nouvelle URL lorsque l'ancienne expire, tant que le média reste disponible sur le profil public.
     </p>
   <?php endif; ?>
 <?php endif; ?>
