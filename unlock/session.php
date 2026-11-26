@@ -1,146 +1,78 @@
 <?php
-// unlock/session.php — session fan côté serveur
-//
-// Le CDN média exige une signature CloudFront : sans session fan, aucun média
-// verrouillé n'est lisible. Deux sources, dans cet ordre :
-//  1. SECOURS — cookie collé à la main (fichier session.manual.txt), qui expire.
-//  2. PRINCIPAL — cookies rafraîchis par refresh.php, appelé par cron.
-// Le premier fichier non expiré gagne. Rien n'est jamais affiché en clair.
+// unlock/session.php — état de la session fan + dépôt manuel de secours
+require __DIR__ . '/lib.php';
+require_once __DIR__ . '/session.php';
 
-const UNLOCK_STATE_DIR   = __DIR__ . '/state';
-const UNLOCK_AUTO_FILE   = UNLOCK_STATE_DIR . '/session.auto.json';
-const UNLOCK_MANUAL_FILE = UNLOCK_STATE_DIR . '/session.manual.txt';
-const UNLOCK_EVENT_FILE  = UNLOCK_STATE_DIR . '/session.events.log';
+$report = unlock_session_report();
+$token = trim((string)@file_get_contents(UNLOCK_STATE_DIR . '/refresh.token'));
+$posted = null;
 
-function unlock_state_dir(): string
-{
-    if (!is_dir(UNLOCK_STATE_DIR)) {
-        @mkdir(UNLOCK_STATE_DIR, 0700, true);
-        @chmod(UNLOCK_STATE_DIR, 0700);
-    }
-    return UNLOCK_STATE_DIR;
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    $_POST['key'] = (string)($_POST['key'] ?? '');
+    ob_start();
+    require __DIR__ . '/session-set.php';
+    $posted = ob_get_clean();
 }
 
-/** Cookie jugé expiré au-delà de cette marge (secondes). */
-function unlock_session_margin(): int
-{
-    return 120;
-}
+function h($value): string { return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8'); }
+?><!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session — MYM Unlock</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 2rem 1rem; font: 15px/1.5 system-ui, sans-serif; background: #0d0f14; color: #e7e9ee; }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+  h2 { font-size: .95rem; margin: 1.6rem 0 .5rem; color: #b9c2d4; }
+  .card { border: 1px solid #262b36; border-radius: 10px; padding: 1rem; background: #12151b; margin-bottom: 1rem; }
+  .row { display: flex; justify-content: space-between; gap: 1rem; padding: .3rem 0; font-size: .86rem; border-bottom: 1px solid #1a1f28; }
+  .row:last-child { border-bottom: 0; }
+  .row span:first-child { color: #8b93a7; }
+  code { font-size: .78rem; word-break: break-all; color: #9aa4bb; }
+  textarea { width: 100%; min-height: 5rem; padding: .6rem; border-radius: 8px; border: 1px solid #262b36; background: #14171e; color: inherit; font: .78rem ui-monospace, monospace; }
+  input[type=text] { width: 100%; padding: .55rem .7rem; border-radius: 8px; border: 1px solid #262b36; background: #14171e; color: inherit; }
+  button { margin-top: .6rem; padding: .55rem 1rem; border-radius: 8px; border: 0; background: #4c7dff; color: #fff; font-weight: 600; cursor: pointer; }
+  .ok { color: #74e2a0; } .bad { color: #ff9a9a; } .warn { color: #ffb27a; }
+  a { color: #7aa2ff; }
+  pre { background: #0f1218; border: 1px solid #1d222c; border-radius: 8px; padding: .7rem; font-size: .75rem; overflow: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Session fan</h1>
+  <p><a href="index.php">← retour</a></p>
 
-/** Écrit un événement de session, borné à 200 lignes. */
-function unlock_session_log(string $message): void
-{
-    unlock_state_dir();
-    $line = gmdate('c') . ' ' . preg_replace('~\s+~', ' ', $message) . "\n";
-    @file_put_contents(UNLOCK_EVENT_FILE, $line, FILE_APPEND | LOCK_EX);
-    $lines = @file(UNLOCK_EVENT_FILE, FILE_IGNORE_NEW_LINES);
-    if (is_array($lines) && count($lines) > 200) {
-        @file_put_contents(UNLOCK_EVENT_FILE, implode("\n", array_slice($lines, -200)) . "\n", LOCK_EX);
-    }
-    @chmod(UNLOCK_EVENT_FILE, 0600);
-}
+  <div class="card">
+    <div class="row"><span>état</span><span class="<?= $report['state'] === 'connected' ? 'ok' : ($report['state'] === 'expired' ? 'warn' : 'bad') ?>"><?= h($report['state']) ?></span></div>
+    <div class="row"><span>source</span><span><?= h($report['source'] ?: '—') ?></span></div>
+    <div class="row"><span>compte</span><span><?= h($report['account'] ?: '—') ?></span></div>
+    <div class="row"><span>expire</span><span><?= $report['expires_at'] ? h(gmdate('c', (int)$report['expires_at'])) : '—' ?></span></div>
+    <div class="row"><span>dernier événement</span><span><code><?= h($report['last_event'] ?: '—') ?></code></span></div>
+  </div>
 
-/** Cookies sous forme de chaîne d'en-tête, ou null. */
-function unlock_cookie_header(?array $state): ?string
-{
-    if (!is_array($state) || empty($state['cookies']) || !is_array($state['cookies'])) return null;
-    $pairs = [];
-    foreach ($state['cookies'] as $name => $value) {
-        if (is_string($name) && is_string($value) && $name !== '') $pairs[] = $name . '=' . $value;
-    }
-    return $pairs ? implode('; ', $pairs) : null;
-}
+  <h2>Rafraîchissement automatique</h2>
+  <div class="card">
+    <p class="row" style="border:0"><span>à appeler par cron toutes les 15 min</span></p>
+    <pre>curl -s "https://<?= h($_SERVER['HTTP_HOST'] ?? 'votre-domaine') ?><?= h(dirname((string)($_SERVER['SCRIPT_NAME'] ?? '/'))) ?>/refresh.php?key=<?= h($token ?: 'TOKEN_ABSENT') ?>"</pre>
+    <p style="font-size:.82rem;color:#8b93a7">Le jeton est créé au premier appel de refresh.php. Tant qu'aucune session n'existe, le login par mot de passe échoue si le compte est fédéré Google : utiliser le dépôt manuel ci-dessous.</p>
+  </div>
 
-/** Indique si un état porte une session encore utilisable. */
-function unlock_state_is_fresh(?array $state): bool
-{
-    if (!is_array($state) || unlock_cookie_header($state) === null) return false;
-    $expires = (int)($state['expires_at'] ?? 0);
-    if ($expires > 0 && $expires - unlock_session_margin() <= time()) return false;
-    return true;
-}
-
-/** Charge un fichier d'état, ou null. */
-function unlock_read_state(string $path): ?array
-{
-    if (!is_file($path)) return null;
-    $raw = @file_get_contents($path);
-    if ($raw === false || trim($raw) === '') return null;
-    $data = json_decode($raw, true);
-    return is_array($data) ? $data : null;
-}
-
-/**
- * État de session utilisable, ou null.
- * Priorité au rafraîchissement automatique, puis au cookie manuel de secours.
- */
-function unlock_session_state(): ?array
-{
-    $auto = unlock_read_state(UNLOCK_AUTO_FILE);
-    if (unlock_state_is_fresh($auto)) {
-        $auto['source'] = 'auto';
-        return $auto;
-    }
-
-    $manual = unlock_read_state(UNLOCK_MANUAL_FILE);
-    if (unlock_state_is_fresh($manual)) {
-        $manual['source'] = 'manual';
-        return $manual;
-    }
-    return null;
-}
-
-/** Diagnostic public, sans secret : sert au bandeau d'état. */
-function unlock_session_report(): array
-{
-    $auto = unlock_read_state(UNLOCK_AUTO_FILE);
-    $manual = unlock_read_state(UNLOCK_MANUAL_FILE);
-    $active = unlock_session_state();
-
-    $state = 'expired';
-    $source = null;
-    $refreshedAt = null;
-    $expiresAt = null;
-    $account = null;
-
-    if ($active !== null) {
-        $state = 'connected';
-        $source = $active['source'];
-        $refreshedAt = $active['fetched_at'] ?? null;
-        $expiresAt = $active['expires_at'] ?? null;
-        $account = $active['account'] ?? null;
-    } elseif (is_array($auto) || is_array($manual)) {
-        $state = 'expired';
-        $source = is_array($auto) ? 'auto' : 'manual';
-        $expiresAt = ($auto['expires_at'] ?? null) ?: ($manual['expires_at'] ?? null);
-    } else {
-        $state = 'missing';
-    }
-
-    $lastEvent = null;
-    if (is_file(UNLOCK_EVENT_FILE)) {
-        $lines = @file(UNLOCK_EVENT_FILE, FILE_IGNORE_NEW_LINES);
-        if (is_array($lines) && $lines) $lastEvent = end($lines);
-    }
-
-    return [
-        'state' => $state,
-        'source' => $source,
-        'account' => $account,
-        'expires_at' => $expiresAt,
-        'refreshed_at' => $refreshedAt,
-        'has_manual' => is_array($manual),
-        'has_auto' => is_array($auto),
-        'last_event' => $lastEvent,
-        'margin' => unlock_session_margin(),
-    ];
-}
-
-/** En-têtes CDN : Referer + cookies de session quand elle existe. */
-function unlock_media_headers_session(): array
-{
-    $headers = unlock_media_headers();
-    $cookie = unlock_cookie_header(unlock_session_state());
-    if ($cookie !== null) $headers[] = 'Cookie: ' . $cookie;
-    return $headers;
-}
+  <h2>Secours — coller un cookie de session</h2>
+  <div class="card">
+    <form method="post" action="session.php">
+      <input type="hidden" name="key" value="<?= h($token) ?>">
+      <p style="font-size:.82rem;color:#8b93a7">Dans le navigateur, sur mym.fans connecté : DevTools → Réseau → une requête vers <code>styx.mym.fans</code> → en-tête <code>Cookie</code>. Coller la valeur entière, ou le JSON <code>{"cookies":{...}}</code>.</p>
+      <textarea name="cookie" placeholder="a=1; b=2; ..."></textarea>
+      <button type="submit">Valider le cookie</button>
+    </form>
+    <?php if ($posted !== null): ?>
+      <pre><?= h($posted) ?></pre>
+    <?php endif; ?>
+  </div>
+</div>
+</body>
+</html>
