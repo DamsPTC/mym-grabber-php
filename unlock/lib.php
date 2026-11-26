@@ -4,14 +4,14 @@
 // FINDINGS d'audit exploités :
 //  A. GET /v1/creators/{username}/posts/{postId} répond 200 et expose gate,
 //     clearance, durée et vignette même pour gate="subscription", sans abonnement.
-//  B. Sur media.prod-v2.mym.fans, le préfixe /medias/AAAA/MM/JJ/{uuid}/HLS/ sert
-//     la playlist variante .m3u8 et tous les segments .ts SANS Policy/Signature,
-//     alors que la playlist master et les images renvoient 403 MissingKey.
+//  B. Sur media.prod-v2.mym.fans, la playlist variante .m3u8 et les segments .ts
+//     du préfixe /HLS/ sont servis SANS Policy/Signature dès lors que la requête
+//     porte la session fan (cf. session.php). La playlist master et les images
+//     restent signées et renvoient 403 MissingKey.
 //
-// `created_at` est porté par le MÉDIA. Sur un post verrouillé, `url` reste null
-// et la vignette est à clé plate ; le dossier S3 se déduit alors d'un média libre
-// publié le même jour (le player MYM fait de même : le dossier est partagé par
-// upload). Le CDN exige un Referer mym.fans pour servir les segments.
+// `created_at` est porté par le MÉDIA. Sur un post verrouillé l'API laisse `url`
+// à null et renvoie une vignette à clé plate : le dossier S3 est déduit d'un
+// média libre publié le même jour (le player MYM s'appuie sur le même dossier).
 
 const UNLOCK_API   = 'https://styx.mym.fans';
 const UNLOCK_WEB   = 'https://mym.fans';
@@ -57,13 +57,19 @@ function unlock_http(string $url, array $options = []): array
 /** En-têtes attendus par le CDN média. */
 function unlock_media_headers(string $extra = ''): array
 {
-    $headers = [
-        'Referer: ' . UNLOCK_WEB . '/',
-        'Origin: ' . UNLOCK_WEB,
-        'Accept: */*',
-    ];
+    $headers = ['Referer: ' . UNLOCK_WEB . '/', 'Origin: ' . UNLOCK_WEB, 'Accept: */*'];
     if ($extra !== '') $headers[] = $extra;
     return $headers;
+}
+
+/** En-têtes CDN enrichis du cookie de session quand il existe. */
+function unlock_cdn_headers(): array
+{
+    if (function_exists('unlock_cookie_header')) {
+        $cookie = unlock_cookie_header(unlock_session_state());
+        if ($cookie !== null) return unlock_media_headers('Cookie: ' . $cookie);
+    }
+    return unlock_media_headers();
 }
 
 function unlock_sanitize_user(string $username): string
@@ -147,10 +153,8 @@ function unlock_sibling_prefix(string $username, string $date, int $maxProbes = 
     $probes = 0;
     foreach ($listed as $post) {
         if (++$probes > $maxProbes) break;
-
         $detail = unlock_fetch_post($username, (string)$post['id']);
         if (isset($detail['error'])) continue;
-
         foreach (unlock_collect_media($detail['post']) as $media) {
             if (($media['mime_type'] ?? '') !== 'application/x-mpegURL') continue;
             if (substr((string)($media['created_at'] ?? ''), 0, 10) !== $date) continue;
@@ -165,8 +169,9 @@ function unlock_sibling_prefix(string $username, string $date, int $maxProbes = 
 function unlock_first_quality(string $prefix, string $uuid): ?string
 {
     $base = UNLOCK_MEDIA . '/' . $prefix . '/HLS/' . $uuid;
+    $headers = unlock_cdn_headers();
     foreach (UNLOCK_QUALITIES as $candidate) {
-        $probe = unlock_http($base . '_' . $candidate . '.m3u8', ['timeout' => 15, 'headers' => unlock_media_headers()]);
+        $probe = unlock_http($base . '_' . $candidate . '.m3u8', ['timeout' => 15, 'headers' => $headers]);
         if ($probe['status'] === 200) return $candidate;
     }
     return null;
@@ -206,9 +211,7 @@ function unlock_resolve(string $username, string $postId): array
         $prefix = unlock_prefix_from_url((string)($media['url'] ?? ''));
 
         if ($prefix === null && $date !== '') {
-            if (!array_key_exists($date, $siblingCache)) {
-                $siblingCache[$date] = unlock_sibling_prefix($username, $date);
-            }
+            if (!array_key_exists($date, $siblingCache)) $siblingCache[$date] = unlock_sibling_prefix($username, $date);
             $prefix = $siblingCache[$date];
         }
 
@@ -223,7 +226,7 @@ function unlock_resolve(string $username, string $postId): array
         $uuid = basename($prefix);
         $quality = unlock_first_quality($prefix, $uuid);
         if ($quality === null) {
-            $entry['state'] = 'dossier ' . $prefix . ' déduit mais aucune variante accessible';
+            $entry['state'] = 'dossier ' . $prefix . ' déduit mais aucune variante accessible (session ?)';
             $result['items'][] = $entry;
             continue;
         }
@@ -243,7 +246,7 @@ function unlock_resolve(string $username, string $postId): array
 
 function unlock_playlist_lines(string $playlistUrl): array
 {
-    $response = unlock_http($playlistUrl, ['timeout' => 20, 'headers' => unlock_media_headers()]);
+    $response = unlock_http($playlistUrl, ['timeout' => 20, 'headers' => unlock_cdn_headers()]);
     if ($response['status'] !== 200) return [null, []];
     $prefix = '';
     if (preg_match('~^(https://[^/]+/.*/)HLS/~', $playlistUrl, $match)) $prefix = $match[1] . 'HLS/';
