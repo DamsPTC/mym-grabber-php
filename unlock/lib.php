@@ -2,14 +2,15 @@
 // unlock/lib.php — déverrouillage du contenu gated (API JSON styx + HLS non signé)
 //
 // FINDING 1 : GET /v1/creators/{username}/posts/{postId} répond 200 et expose
-//   medias[].filename / created_at / thumbnail_url même quand gate="subscription"
-//   et clearance="required", sans abonnement et sans session.
+//   les médias complets, y compris quand gate="subscription" et clearance="required",
+//   sans abonnement et sans session.
 // FINDING 2 : sur media.prod-v2.mym.fans, la playlist .m3u8 variante et tous les
 //   segments .ts du préfixe /HLS/ sont servis SANS Policy/Signature/Key-Pair-Id.
 //
-// Le dossier S3 de la vidéo est porté par thumbnail_url, dont le chemin
-// /medias/v2/{base64url} décode un JSON {"bucket":..,"key":"medias/AAAA/MM/JJ/{uuid}/thumbnails/.."}.
-// Le flux complet se reconstruit depuis ce préfixe.
+// ATTENTION À LA FORME DU PAYLOAD : un média verrouillé porte deux blocs.
+//   - medias[].teaser : vignette de teasing, clé plate medias/AAAA/MM/JJ/{fichier}.jpg
+//   - medias[].media[] : le média réel, clé en dossier medias/AAAA/MM/JJ/{uuid}/thumbnails/...
+// Seul le second porte le préfixe S3 exploitable pour reconstruire le HLS.
 
 const UNLOCK_API   = 'https://styx.mym.fans';
 const UNLOCK_MEDIA = 'https://media.prod-v2.mym.fans';
@@ -85,9 +86,10 @@ function unlock_decode_descriptor(string $descriptor): ?array
 }
 
 /**
- * Préfixe S3 de la vidéo, déduit de la clé encodée dans thumbnail_url.
+ * Préfixe S3 du média, déduit de la clé encodée dans son thumbnail_url.
  * Ex : medias/2026/08/20/{uuid}/thumbnails/{uuid}.0000000.jpg
  *   ->  medias/2026/08/20/{uuid}
+ * Retourne null pour une clé plate (teaser), qui n'a pas de dossier dédié.
  */
 function unlock_media_prefix(array $media): ?string
 {
@@ -98,6 +100,24 @@ function unlock_media_prefix(array $media): ?string
     $key = is_array($descriptor) ? (string)($descriptor['key'] ?? '') : '';
     if ($key === '' || strpos($key, '/thumbnails/') === false) return null;
     return explode('/thumbnails/', $key)[0];
+}
+
+/**
+ * Tous les médias réels d'un post : le bloc media[] de chaque medias[],
+ * plus medias[] lui-même en repli quand il n'y a pas de sous-tableau.
+ */
+function unlock_collect_media(array $post): array
+{
+    $collected = [];
+    foreach (($post['medias'] ?? []) as $group) {
+        $nested = $group['media'] ?? null;
+        if (is_array($nested) && $nested) {
+            foreach ($nested as $item) if (is_array($item)) $collected[] = $item;
+            continue;
+        }
+        $collected[] = $group;
+    }
+    return $collected;
 }
 
 /** Interroge l'API : détail d'un post précis. */
@@ -155,7 +175,13 @@ function unlock_resolve(string $username, string $postId): array
         'items'     => [],
     ];
 
-    foreach (($post['medias'] ?? []) as $media) {
+    $medias = unlock_collect_media($post);
+    if (!$medias) {
+        $result['items'][] = ['state' => 'aucun média dans la réponse'];
+        return $result;
+    }
+
+    foreach ($medias as $media) {
         $entry = [
             'kind'     => (string)($media['type'] ?? 'unknown'),
             'mime'     => (string)($media['mime_type'] ?? ''),
@@ -194,7 +220,7 @@ function unlock_resolve(string $username, string $postId): array
             continue;
         }
 
-        // Image : la clé directe reste signée sur le CDN.
+        // Image : la clé directe reste signée sur le CDN, on affiche l'aperçu.
         $entry['state'] = 'image';
         $entry['thumb'] = (string)($media['thumbnail_url'] ?? '');
         $result['items'][] = $entry;
