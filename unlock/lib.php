@@ -9,11 +9,11 @@
 //     alors que la playlist master et les images renvoient 403 MissingKey.
 //
 // LIMITE MESURÉE : sur un post VERROUILLÉ, l'API anonyme laisse `url` à null et
-// renvoie une vignette à clé plate (sans dossier /thumbnails/), donc le préfixe
-// n'est pas directement lisible. En revanche, les posts LIBRES du même profil
-// exposent `url` et une clé en dossier. Le dossier S3 est daté (AAAA/MM/JJ), donc
-// le préfixe d'un post verrouillé se déduit d'un post libre de la même journée.
-// C'est la stratégie principale ; les candidats directs servent de repli.
+// renvoie une vignette à clé plate (pas de dossier /thumbnails/). Les posts LIBRES
+// du même profil, eux, exposent `url` complet et une clé en dossier.
+// Le dossier S3 d'un média est daté par sa date de publication : le préfixe d'un
+// post verrouillé se déduit donc d'un post libre du même jour.
+// La liste /posts n'expose pas created_at : chaque candidat est détaillé.
 
 const UNLOCK_API   = 'https://styx.mym.fans';
 const UNLOCK_MEDIA = 'https://media.prod-v2.mym.fans';
@@ -67,7 +67,6 @@ function unlock_is_uuid(string $value): bool
     return (bool)preg_match('~^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$~i', $value);
 }
 
-/** Base64url -> JSON (padding à restaurer, descripteurs non paddés). */
 function unlock_decode_descriptor(string $descriptor): ?array
 {
     $normalized = strtr($descriptor, '-_', '+/');
@@ -82,11 +81,8 @@ function unlock_decode_descriptor(string $descriptor): ?array
 /** Préfixe S3 depuis une URL média (chemin direct ou descripteur v2). */
 function unlock_prefix_from_url(string $url): ?string
 {
-    if ($url === '') return null;
-    if (strpos($url, UNLOCK_MEDIA . '/') !== 0) return null;
-
+    if ($url === '' || strpos($url, UNLOCK_MEDIA . '/') !== 0) return null;
     if (preg_match('~^https://[^/]+/(medias/\d{4}/\d{2}/\d{2}/[^/?]+)/HLS/~', $url, $m)) return $m[1];
-
     if (preg_match('~/medias/v2/([^?]+)~', $url, $m)) {
         $descriptor = unlock_decode_descriptor($m[1]);
         $key = is_array($descriptor) ? (string)($descriptor['key'] ?? '') : '';
@@ -95,7 +91,6 @@ function unlock_prefix_from_url(string $url): ?string
     return null;
 }
 
-/** Tous les médias du post. */
 function unlock_collect_media(array $post): array
 {
     $collected = [];
@@ -134,17 +129,24 @@ function unlock_list_posts(string $username, int $limit = 30): array
 }
 
 /**
- * Préfixe d'un post libre publié le même jour que $date (AAAA-MM-JJ).
- * Fournit le dossier S3 manquant des posts verrouillés.
+ * Préfixe d'un post libre publié le même jour (AAAA-MM-JJ).
+ * La liste n'exposant pas created_at, chaque candidat est détaillé puis daté.
  */
-function unlock_sibling_prefix(string $username, string $date): ?string
+function unlock_sibling_prefix(string $username, string $date, int $maxProbes = 20): ?string
 {
-    foreach (unlock_list_posts($username, 60) as $post) {
-        if (($post['gate'] ?? 'none') !== 'none') continue;
-        if (substr((string)($post['created_at'] ?? ''), 0, 10) !== $date) continue;
+    $listed = unlock_list_posts($username, 40);
+    if (isset($listed['error'])) return null;
+
+    $probes = 0;
+    foreach ($listed as $post) {
+        if (++$probes > $maxProbes) break;
 
         $detail = unlock_fetch_post($username, (string)$post['id']);
         if (isset($detail['error'])) continue;
+
+        $created = (string)($detail['post']['created_at'] ?? '');
+        if (substr($created, 0, 10) !== $date) continue;
+
         foreach (unlock_collect_media($detail['post']) as $media) {
             $prefix = unlock_prefix_from_url((string)($media['url'] ?? ''));
             if ($prefix !== null) return $prefix;
@@ -153,7 +155,6 @@ function unlock_sibling_prefix(string $username, string $date): ?string
     return null;
 }
 
-/** Première qualité servie en 200 pour un préfixe. */
 function unlock_first_quality(string $prefix, string $uuid): ?string
 {
     $base = UNLOCK_MEDIA . '/' . $prefix . '/HLS/' . $uuid;
@@ -182,8 +183,9 @@ function unlock_resolve(string $username, string $postId): array
         'items'     => [],
     ];
 
-    $date = substr((string)($post['created_at'] ?? $post['updated_at'] ?? ''), 0, 10);
+    $date = substr((string)($post['created_at'] ?? ''), 0, 10);
     $sibling = null;
+    $siblingTried = false;
 
     foreach (unlock_collect_media($post) as $media) {
         $entry = ['kind' => (string)($media['type'] ?? 'unknown'), 'mime' => (string)($media['mime_type'] ?? ''), 'duration' => $media['duration'] ?? null];
@@ -195,17 +197,17 @@ function unlock_resolve(string $username, string $postId): array
             continue;
         }
 
-        // 1) URL signée du média (posts libres).
         $prefix = unlock_prefix_from_url((string)($media['url'] ?? ''));
 
-        // 2) Préfixe d'un post libre du même jour (posts verrouillés).
         if ($prefix === null && $date !== '') {
-            if ($sibling === null) $sibling = unlock_sibling_prefix($username, $date);
+            if (!$siblingTried) { $sibling = unlock_sibling_prefix($username, $date); $siblingTried = true; }
             $prefix = $sibling;
         }
 
         if ($prefix === null) {
-            $entry['state'] = 'préfixe introuvable (aucun post libre le ' . ($date ?: '?') . ')';
+            $entry['state'] = $date !== ''
+                ? 'aucun post libre publié le ' . $date . ' pour déduire le dossier'
+                : 'date de publication absente';
             $result['items'][] = $entry;
             continue;
         }
@@ -213,7 +215,7 @@ function unlock_resolve(string $username, string $postId): array
         $uuid = basename($prefix);
         $quality = unlock_first_quality($prefix, $uuid);
         if ($quality === null) {
-            $entry['state'] = 'préfixe ' . $prefix . ' résolu mais aucune variante accessible';
+            $entry['state'] = 'dossier ' . $prefix . ' déduit mais aucune variante accessible';
             $result['items'][] = $entry;
             continue;
         }
