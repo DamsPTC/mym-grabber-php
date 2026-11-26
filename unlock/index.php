@@ -13,23 +13,28 @@ function unlock_parse_post(string $raw): string
 }
 
 $username = isset($_GET['u']) ? unlock_sanitize_user((string)$_GET['u']) : '';
-$rawInput = isset($_GET['t']) ? (string)$_GET['t'] : '';
+$rawInput = isset($_GET['t']) ? trim((string)$_GET['t']) : '';
 $postId   = unlock_parse_post($rawInput);
 $result   = null;
-$posts    = [];
+$posts    = null;
 
-if ($username === '' && $postId !== '') {
-    // URL collée seule : on tente de retrouver le pseudo depuis le chemin.
-    if (preg_match('~mym\.fans/([A-Za-z0-9_.\-]+)~i', $rawInput, $m)) $username = unlock_sanitize_user($m[1]);
+// Une URL collée seule porte souvent le pseudo : on le récupère.
+if ($username === '' && $postId !== '' && preg_match('~mym\.fans/([A-Za-z0-9_.\-]+)~i', $rawInput, $m)) {
+    $username = unlock_sanitize_user($m[1]);
 }
 
 if ($username !== '' && $postId !== '') {
     $result = unlock_resolve($username, $postId);
 } elseif ($username !== '' && $rawInput === '') {
     $posts = unlock_list_posts($username);
+} elseif ($rawInput !== '' && $postId === '') {
+    $result = ['error' => 'UUID de post introuvable dans la saisie'];
 }
 
 function h($value): string { return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8'); }
+
+// Erreurs légitimes de unlock_list_posts() : ne pas les afficher comme « aucun post ».
+$postsError = (is_array($posts) && isset($posts['error'])) ? $posts['error'] : null;
 ?><!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -75,8 +80,8 @@ function h($value): string { return htmlspecialchars((string)$value, ENT_QUOTES,
     <button type="submit">Analyser</button>
   </form>
 
-  <?php if (is_array($posts) && isset($posts['error'])): ?>
-    <div class="card err"><?= h($posts['error']) ?></div>
+  <?php if ($postsError !== null): ?>
+    <div class="card err"><?= h($postsError) ?></div>
   <?php elseif (is_array($posts) && $posts): ?>
     <div class="card">
       <strong>Posts récents</strong>
@@ -90,7 +95,7 @@ function h($value): string { return htmlspecialchars((string)$value, ENT_QUOTES,
       <?php endforeach; ?>
       </ul>
     </div>
-  <?php elseif (is_array($posts) && !$posts && $username !== ''): ?>
+  <?php elseif (is_array($posts) && !$posts): ?>
     <div class="card err">Aucun post retourné pour ce pseudo.</div>
   <?php endif; ?>
 
