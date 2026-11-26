@@ -9,11 +9,10 @@
 //     alors que la playlist master et les images renvoient 403 MissingKey.
 //
 // LIMITE MESURÉE : sur un post VERROUILLÉ, l'API anonyme laisse `url` à null et
-// renvoie une vignette à clé plate (pas de dossier /thumbnails/). Les posts LIBRES
-// du même profil, eux, exposent `url` complet et une clé en dossier.
-// Le dossier S3 d'un média est daté par sa date de publication : le préfixe d'un
-// post verrouillé se déduit donc d'un post libre du même jour.
-// La liste /posts n'expose pas created_at : chaque candidat est détaillé.
+// renvoie une vignette à clé plate. Le dossier S3 reste daté, et `created_at`
+// est porté par le MÉDIA (pas par le post). Un post libre du même profil expose,
+// lui, une URL complète. Le préfixe d'un média verrouillé se déduit donc d'un
+// média libre de la même journée.
 
 const UNLOCK_API   = 'https://styx.mym.fans';
 const UNLOCK_MEDIA = 'https://media.prod-v2.mym.fans';
@@ -129,10 +128,10 @@ function unlock_list_posts(string $username, int $limit = 30): array
 }
 
 /**
- * Préfixe d'un post libre publié le même jour (AAAA-MM-JJ).
- * La liste n'exposant pas created_at, chaque candidat est détaillé puis daté.
+ * Préfixe d'un média libre publié le même jour (AAAA-MM-JJ).
+ * La date est portée par le média : chaque candidat est détaillé puis filtré.
  */
-function unlock_sibling_prefix(string $username, string $date, int $maxProbes = 20): ?string
+function unlock_sibling_prefix(string $username, string $date, int $maxProbes = 25): ?string
 {
     $listed = unlock_list_posts($username, 40);
     if (isset($listed['error'])) return null;
@@ -144,10 +143,9 @@ function unlock_sibling_prefix(string $username, string $date, int $maxProbes = 
         $detail = unlock_fetch_post($username, (string)$post['id']);
         if (isset($detail['error'])) continue;
 
-        $created = (string)($detail['post']['created_at'] ?? '');
-        if (substr($created, 0, 10) !== $date) continue;
-
         foreach (unlock_collect_media($detail['post']) as $media) {
+            if (($media['mime_type'] ?? '') !== 'application/x-mpegURL') continue;
+            if (substr((string)($media['created_at'] ?? ''), 0, 10) !== $date) continue;
             $prefix = unlock_prefix_from_url((string)($media['url'] ?? ''));
             if ($prefix !== null) return $prefix;
         }
@@ -183,9 +181,7 @@ function unlock_resolve(string $username, string $postId): array
         'items'     => [],
     ];
 
-    $date = substr((string)($post['created_at'] ?? ''), 0, 10);
-    $sibling = null;
-    $siblingTried = false;
+    $siblingCache = [];
 
     foreach (unlock_collect_media($post) as $media) {
         $entry = ['kind' => (string)($media['type'] ?? 'unknown'), 'mime' => (string)($media['mime_type'] ?? ''), 'duration' => $media['duration'] ?? null];
@@ -197,17 +193,20 @@ function unlock_resolve(string $username, string $postId): array
             continue;
         }
 
+        $date = substr((string)($media['created_at'] ?? ''), 0, 10);
         $prefix = unlock_prefix_from_url((string)($media['url'] ?? ''));
 
         if ($prefix === null && $date !== '') {
-            if (!$siblingTried) { $sibling = unlock_sibling_prefix($username, $date); $siblingTried = true; }
-            $prefix = $sibling;
+            if (!array_key_exists($date, $siblingCache)) {
+                $siblingCache[$date] = unlock_sibling_prefix($username, $date);
+            }
+            $prefix = $siblingCache[$date];
         }
 
         if ($prefix === null) {
             $entry['state'] = $date !== ''
-                ? 'aucun post libre publié le ' . $date . ' pour déduire le dossier'
-                : 'date de publication absente';
+                ? 'aucun média libre publié le ' . $date . ' pour déduire le dossier'
+                : 'date de publication absente du média';
             $result['items'][] = $entry;
             continue;
         }
