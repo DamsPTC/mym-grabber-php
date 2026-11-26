@@ -1,35 +1,30 @@
 <?php
-// unlock/debug.php — la page publique contient-elle l'URL HLS ?
+// unlock/debug.php — curl du serveur vers le CDN média
 require __DIR__ . '/lib.php';
 
-$username = isset($_GET['u']) ? unlock_sanitize_user((string)$_GET['u']) : 'Maximeyedess';
-$postId   = isset($_GET['p']) ? trim((string)$_GET['p']) : '395f38c4-6adf-4f67-a5bf-2c1c349a2906';
+$prefix = isset($_GET['prefix']) ? (string)$_GET['prefix'] : 'medias/2022/10/19/20221019093038-lN-3VuUTiEResqCCnTFEuj08';
+$uuid = basename($prefix);
+$url = UNLOCK_MEDIA . '/' . $prefix . '/HLS/' . $uuid . '_720p.m3u8';
 
 header('Content-Type: application/json; charset=utf-8');
-$url = UNLOCK_WEB . '/' . rawurlencode($username) . '?tab=posts&media=' . rawurlencode($postId);
-$r = unlock_http($url, ['headers' => ['Accept: text/html'], 'timeout' => 25]);
+$out = ['url' => $url];
 
-$out = ['pageStatus' => $r['status'], 'pageLen' => strlen($r['body'])];
-$body = $r['body'];
-
-$out['hasHlsLiteral'] = substr_count($body, '/HLS/');
-$out['hasMediaHost'] = substr_count($body, 'media.prod-v2.mym.fans');
-$out['hasEscaped'] = substr_count($body, 'media.prod-v2.mym.fans\\/');
-$out['hasM3u8'] = substr_count($body, '.m3u8');
-
-// échantillons bruts autour des occurrences
-$samples = [];
-$offset = 0;
-for ($i = 0; $i < 3; $i++) {
-    $pos = strpos($body, '/HLS/', $offset);
-    if ($pos === false) break;
-    $samples[] = substr($body, max(0, $pos - 90), 190);
-    $offset = $pos + 5;
+foreach ([
+    'sans-entetes' => [],
+    'referer' => ['Referer: https://mym.fans/'],
+    'referer+origin' => ['Referer: https://mym.fans/', 'Origin: https://mym.fans'],
+    'navigateur' => unlock_media_headers(),
+] as $label => $headers) {
+    $r = unlock_http($url, ['headers' => $headers, 'timeout' => 15]);
+    $out[$label] = ['status' => $r['status'], 'type' => $r['type'], 'body' => substr($r['body'], 0, 90), 'err' => $r['error']];
 }
-$out['samples'] = $samples;
 
-// regex actuels
-$out['regexSlash'] = preg_match_all('~https://media\.prod-v2\.mym\.fans/medias/[^"\'\\\\\s<>]+\.m3u8[^"\'\\\\\s<>]*~', $body);
-$out['regexSlashed'] = preg_match_all('~https://media\.prod-v2\.mym\.fans\\\\/medias\\\\/[^"\'\\\\\s<>]+\.m3u8~', $body);
+$out['qualites'] = [];
+foreach (UNLOCK_QUALITIES as $q) {
+    $probe = unlock_http(UNLOCK_MEDIA . '/' . $prefix . '/HLS/' . $uuid . '_' . $q . '.m3u8', ['timeout' => 12, 'headers' => unlock_media_headers()]);
+    $out['qualites'][$q] = $probe['status'];
+}
+
+$out['seg'] = unlock_http(UNLOCK_MEDIA . '/' . $prefix . '/HLS/' . $uuid . '_720p_00001.ts', ['timeout' => 20, 'headers' => unlock_media_headers(), 'range' => 'bytes=0-99'])['status'];
 
 echo json_encode($out, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
