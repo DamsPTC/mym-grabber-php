@@ -5,8 +5,7 @@
 //   medias[].filename / created_at / thumbnail_url même quand gate="subscription"
 //   et clearance="required", sans abonnement et sans session.
 // FINDING 2 : sur media.prod-v2.mym.fans, la playlist .m3u8 variante et tous les
-//   segments .ts du préfixe /HLS/ sont servis SANS Policy/Signature/Key-Pair-Id
-//   (les images, elles, renvoient 403 MissingKey).
+//   segments .ts du préfixe /HLS/ sont servis SANS Policy/Signature/Key-Pair-Id.
 //
 // Le dossier S3 de la vidéo est porté par thumbnail_url, dont le chemin
 // /medias/v2/{base64url} décode un JSON {"bucket":..,"key":"medias/AAAA/MM/JJ/{uuid}/thumbnails/.."}.
@@ -70,10 +69,16 @@ function unlock_is_uuid(string $value): bool
     return (bool)preg_match('~^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$~i', $value);
 }
 
-/** Base64url -> JSON. Retourne null si le descripteur est invalide. */
+/**
+ * Base64url -> JSON. Les descripteurs CDN sont servis SANS padding : il faut
+ * le restaurer, sinon base64_decode() en mode strict échoue.
+ */
 function unlock_decode_descriptor(string $descriptor): ?array
 {
-    $raw = base64_decode(strtr($descriptor, '-_', '+/'), true);
+    $normalized = strtr($descriptor, '-_', '+/');
+    $remainder = strlen($normalized) % 4;
+    if ($remainder > 0) $normalized .= str_repeat('=', 4 - $remainder);
+    $raw = base64_decode($normalized, true);
     if ($raw === false || $raw === '') return null;
     $json = json_decode($raw, true);
     return is_array($json) ? $json : null;
@@ -160,7 +165,7 @@ function unlock_resolve(string $username, string $postId): array
         if (($media['mime_type'] ?? '') === 'application/x-mpegURL') {
             $prefix = unlock_media_prefix($media);
             if ($prefix === null) {
-                $entry['state'] = 'chemin introuvable';
+                $entry['state'] = 'chemin introuvable (descripteur CDN inexploitable)';
                 $result['items'][] = $entry;
                 continue;
             }
