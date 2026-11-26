@@ -1,23 +1,26 @@
 <?php
-// unlock/lib.php — déverrouillage du contenu gated (API JSON styx + HLS non signé)
+// unlock/lib.php — déverrouillage du contenu gated MYM
 //
-// FINDING 1 : GET /v1/creators/{username}/posts/{postId} répond 200 et expose
-//   les médias complets, y compris quand gate="subscription" et clearance="required",
-//   sans abonnement et sans session.
-// FINDING 2 : sur media.prod-v2.mym.fans, la playlist .m3u8 variante et tous les
-//   segments .ts du préfixe /HLS/ sont servis SANS Policy/Signature/Key-Pair-Id.
+// Chaîne établie par audit :
+//  1. La page publique du post expose une URL signée du CDN média dans le DOM.
+//     Son chemin porte le vrai préfixe S3 : /medias/AAAA/MM/JJ/{uuid}/HLS/{uuid}...
+//  2. Sur ce préfixe, la playlist variante .m3u8 et tous les segments .ts sont
+//     servis SANS Policy/Signature/Key-Pair-Id — alors que la playlist master et
+//     les images renvoient 403 MissingKey.
+//  3. Le player du site résout ce chemin sans appel API dédié : le chemin signé
+//     est la seule source fiable (le champ `filename` de l'API est parfois
+//     décorrélé du dossier réel).
 //
-// ATTENTION À LA FORME DU PAYLOAD : un média verrouillé porte deux blocs.
-//   - medias[].teaser : vignette de teasing, clé plate medias/AAAA/MM/JJ/{fichier}.jpg
-//   - medias[].media[] : le média réel, clé en dossier medias/AAAA/MM/JJ/{uuid}/thumbnails/...
-// Seul le second porte le préfixe S3 exploitable pour reconstruire le HLS.
+// Repli quand aucune URL signée n'est trouvée : préfixe reconstruit depuis le
+// descripteur base64url de thumbnail_url.
 
 const UNLOCK_API   = 'https://styx.mym.fans';
+const UNLOCK_WEB   = 'https://mym.fans';
 const UNLOCK_MEDIA = 'https://media.prod-v2.mym.fans';
 const UNLOCK_QUALITIES = ['1080p', '720p', '480p', '360p'];
 const UNLOCK_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36';
 
-/** Requête HTTP générique, sans cookies : l'API et le CDN sont anonymes. */
+/** Requête HTTP générique. */
 function unlock_http(string $url, array $options = []): array
 {
     $method  = $options['method']  ?? 'GET';
@@ -70,10 +73,7 @@ function unlock_is_uuid(string $value): bool
     return (bool)preg_match('~^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$~i', $value);
 }
 
-/**
- * Base64url -> JSON. Les descripteurs CDN sont servis SANS padding : il faut
- * le restaurer, sinon base64_decode() en mode strict échoue.
- */
+/** Base64url -> JSON (padding à restaurer, les descripteurs sont non paddés). */
 function unlock_decode_descriptor(string $descriptor): ?array
 {
     $normalized = strtr($descriptor, '-_', '+/');
@@ -86,26 +86,54 @@ function unlock_decode_descriptor(string $descriptor): ?array
 }
 
 /**
- * Préfixe S3 du média, déduit de la clé encodée dans son thumbnail_url.
- * Ex : medias/2026/08/20/{uuid}/thumbnails/{uuid}.0000000.jpg
- *   ->  medias/2026/08/20/{uuid}
- * Retourne null pour une clé plate (teaser), qui n'a pas de dossier dédié.
+ * Préfixe S3 trouvé dans une URL CDN, quel que soit son habillage.
+ * Accepte /medias/v2/{b64} comme les chemins directs /medias/AAAA/MM/JJ/{uuid}/HLS/...
  */
-function unlock_media_prefix(array $media): ?string
+function unlock_prefix_from_url(string $url): ?string
 {
-    $thumb = (string)($media['thumbnail_url'] ?? '');
-    if ($thumb === '') return null;
-    if (!preg_match('~/medias/v2/([^?]+)~', $thumb, $match)) return null;
-    $descriptor = unlock_decode_descriptor($match[1]);
-    $key = is_array($descriptor) ? (string)($descriptor['key'] ?? '') : '';
-    if ($key === '' || strpos($key, '/thumbnails/') === false) return null;
-    return explode('/thumbnails/', $key)[0];
+    if (strpos($url, UNLOCK_MEDIA . '/') !== 0) return null;
+
+    // Chemin direct déjà résolu : on ne garde que jusqu'à /HLS/.
+    if (preg_match('~/medias/\d{4}/\d{2}/\d{2}/([^/?]+)/HLS/~', $url, $m)) {
+        return 'medias/' . substr($url, strlen(UNLOCK_MEDIA . '/medias/'), strlen($url))
+            === '' ? null : preg_replace('~/HLS/.*$~', '', substr($url, strlen(UNLOCK_MEDIA . '/')));
+    }
+
+    // Descripteur base64url v2.
+    if (preg_match('~/medias/v2/([^?]+)~', $url, $m)) {
+        $descriptor = unlock_decode_descriptor($m[1]);
+        $key = is_array($descriptor) ? (string)($descriptor['key'] ?? '') : '';
+        if ($key !== '' && strpos($key, '/thumbnails/') !== false) {
+            return explode('/thumbnails/', $key)[0];
+        }
+    }
+    return null;
 }
 
 /**
- * Tous les médias réels d'un post : le bloc media[] de chaque medias[],
- * plus medias[] lui-même en repli quand il n'y a pas de sous-tableau.
+ * Récupère l'URL HLS signée du post sur sa page publique.
+ * La page expose l'URL complète ; le chemin suffit, la signature est ignorée.
  */
+function unlock_page_playlist(string $username, string $postId): ?string
+{
+    $url = UNLOCK_WEB . '/' . rawurlencode($username) . '?tab=posts&media=' . rawurlencode($postId);
+    $response = unlock_http($url, [
+        'headers' => ['Accept: text/html', 'Referer: ' . UNLOCK_WEB . '/'],
+        'timeout' => 25,
+    ]);
+    if ($response['status'] !== 200) return null;
+
+    if (!preg_match_all('~https://media\.prod-v2\.mym\.fans/medias/[^"\'\\\\\s<>]+\.m3u8[^"\'\\\\\s<>]*~', $response['body'], $matches)) {
+        return null;
+    }
+    // On préfère une variante (…_720p.m3u8) à la master.
+    foreach ($matches[0] as $candidate) {
+        if (preg_match('~_\d{3,4}p\.m3u8~', $candidate)) return $candidate;
+    }
+    return $matches[0][0] ?? null;
+}
+
+/** Tous les médias du post (bloc media[] imbriqué, sinon medias[]). */
 function unlock_collect_media(array $post): array
 {
     $collected = [];
@@ -120,47 +148,37 @@ function unlock_collect_media(array $post): array
     return $collected;
 }
 
-/** Interroge l'API : détail d'un post précis. */
 function unlock_fetch_post(string $username, string $postId): array
 {
     $response = unlock_http(
         UNLOCK_API . '/v1/creators/' . rawurlencode($username) . '/posts/' . rawurlencode($postId),
         ['headers' => ['X-Platform: fans', 'Accept: application/json']]
     );
-    if ($response['status'] !== 200) {
-        return ['error' => 'post HTTP ' . $response['status']];
-    }
+    if ($response['status'] !== 200) return ['error' => 'post HTTP ' . $response['status']];
     $payload = json_decode($response['body'], true);
-    if (!is_array($payload) || !isset($payload['data'])) {
-        return ['error' => 'réponse illisible'];
-    }
+    if (!is_array($payload) || !isset($payload['data'])) return ['error' => 'réponse illisible'];
     return ['post' => $payload['data']];
 }
 
-/** Derniers posts d'un créateur, pour lister les contenus verrouillés. */
 function unlock_list_posts(string $username, int $limit = 30): array
 {
     $response = unlock_http(
         UNLOCK_API . '/v1/creators/' . rawurlencode($username) . '/posts?limit=' . $limit,
         ['headers' => ['X-Platform: fans', 'Accept: application/json']]
     );
-    if ($response['status'] !== 200) {
-        return ['error' => 'liste HTTP ' . $response['status']];
-    }
+    if ($response['status'] !== 200) return ['error' => 'liste HTTP ' . $response['status']];
     $payload = json_decode($response['body'], true);
     return is_array($payload) ? ($payload['data'] ?? []) : [];
 }
 
 /**
- * Résolution d'un post : gate, qualité disponible, playlist réécrite.
- * Aucune URL signée n'est exposée au navigateur.
+ * Résout un post : gate, qualité disponible, playlist.
+ * Ne renvoie jamais d'URL signée au navigateur.
  */
 function unlock_resolve(string $username, string $postId): array
 {
     $username = unlock_sanitize_user($username);
-    if ($username === '' || !unlock_is_uuid($postId)) {
-        return ['error' => 'paramètres invalides'];
-    }
+    if ($username === '' || !unlock_is_uuid($postId)) return ['error' => 'paramètres invalides'];
 
     $fetched = unlock_fetch_post($username, $postId);
     if (isset($fetched['error'])) return $fetched;
@@ -176,11 +194,13 @@ function unlock_resolve(string $username, string $postId): array
     ];
 
     $medias = unlock_collect_media($post);
-    if (!$medias) {
-        $result['items'][] = ['state' => 'aucun média dans la réponse'];
-        return $result;
-    }
+    $hasVideo = false;
+    foreach ($medias as $media) if (($media['mime_type'] ?? '') === 'application/x-mpegURL') $hasVideo = true;
 
+    // Une seule récupération de page, partagée par les vidéos du post.
+    $pagePlaylist = $hasVideo ? unlock_page_playlist($username, $postId) : null;
+
+    $videoIndex = 0;
     foreach ($medias as $media) {
         $entry = [
             'kind'     => (string)($media['type'] ?? 'unknown'),
@@ -189,18 +209,31 @@ function unlock_resolve(string $username, string $postId): array
         ];
 
         if (($media['mime_type'] ?? '') === 'application/x-mpegURL') {
-            $prefix = unlock_media_prefix($media);
+            $prefix = null;
+
+            // Source 1 : le chemin de la playlist publiée par la page.
+            if ($pagePlaylist !== null) {
+                $base = preg_replace('~_\d{3,4}p\.m3u8.*$~', '', $pagePlaylist);
+                if ($videoIndex > 0) $base .= ''; // une variante par vidéo, la première suffit
+                $prefix = preg_replace('~^' . preg_quote(UNLOCK_MEDIA . '/', '~') . '~', '', $base);
+                $prefix = preg_replace('~/HLS/[^/]*$~', '', $prefix);
+            }
+            // Source 2 : descripteur de la vignette.
+            if ($prefix === null) $prefix = unlock_prefix_from_url((string)($media['thumbnail_url'] ?? ''));
+
+            $videoIndex++;
+
             if ($prefix === null) {
-                $entry['state'] = 'chemin introuvable (descripteur CDN inexploitable)';
+                $entry['state'] = 'chemin introuvable';
                 $result['items'][] = $entry;
                 continue;
             }
-            $uuid = basename($prefix);
-            $base = UNLOCK_MEDIA . '/' . $prefix . '/HLS/' . $uuid;
 
+            $uuid = basename($prefix);
+            $baseUrl = UNLOCK_MEDIA . '/' . $prefix . '/HLS/' . $uuid;
             $quality = null;
             foreach (UNLOCK_QUALITIES as $candidate) {
-                $probe = unlock_http($base . '_' . $candidate . '.m3u8', ['timeout' => 15]);
+                $probe = unlock_http($baseUrl . '_' . $candidate . '.m3u8', ['timeout' => 15]);
                 if ($probe['status'] === 200) { $quality = $candidate; break; }
             }
             if ($quality === null) {
@@ -211,37 +244,33 @@ function unlock_resolve(string $username, string $postId): array
 
             $entry['state']   = 'accessible';
             $entry['quality'] = $quality;
-            $entry['signed']  = false;
             $entry['prefix']  = $prefix;
             $entry['uuid']    = $uuid;
-            // Playlist absolue pour hls.js dans une data-URI.
-            $entry['playlist_abs'] = unlock_absolutize_playlist($base . '_' . $quality . '.m3u8');
+            $entry['playlist_abs'] = unlock_absolutize_playlist($baseUrl . '_' . $quality . '.m3u8');
             $result['items'][] = $entry;
             continue;
         }
 
-        // Image : la clé directe reste signée sur le CDN, on affiche l'aperçu.
         $entry['state'] = 'image';
         $entry['thumb'] = (string)($media['thumbnail_url'] ?? '');
         $result['items'][] = $entry;
     }
 
+    if (!$result['items']) $result['items'][] = ['state' => 'aucun média dans la réponse'];
     return $result;
 }
 
-/** Découpe une playlist en lignes, et renvoie [prefixe, lignes]. */
+/** [prefixe, lignes] d'une playlist brute. */
 function unlock_playlist_lines(string $playlistUrl): array
 {
     $response = unlock_http($playlistUrl, ['timeout' => 20]);
     if ($response['status'] !== 200) return [null, []];
     $prefix = '';
-    if (preg_match('~^(https://[^/]+/.*/)HLS/~', $playlistUrl, $match)) {
-        $prefix = $match[1] . 'HLS/';
-    }
+    if (preg_match('~^(https://[^/]+/.*/)HLS/~', $playlistUrl, $match)) $prefix = $match[1] . 'HLS/';
     return [$prefix, preg_split('~\r?\n~', trim($response['body']))];
 }
 
-/** Playlist avec segments en URL absolues (pour data-URI / hls.js). */
+/** Playlist à segments absolus (data-URI / hls.js). */
 function unlock_absolutize_playlist(string $playlistUrl): string
 {
     [$prefix, $lines] = unlock_playlist_lines($playlistUrl);
@@ -255,7 +284,7 @@ function unlock_absolutize_playlist(string $playlistUrl): string
     return implode("\n", $out);
 }
 
-/** Playlist avec segments routés par le proxy local (téléchargement ffmpeg). */
+/** Playlist à segments proxifiés (téléchargement via ffmpeg). */
 function unlock_rewrite_playlist(string $playlistUrl): string
 {
     [$prefix, $lines] = unlock_playlist_lines($playlistUrl);
@@ -270,14 +299,12 @@ function unlock_rewrite_playlist(string $playlistUrl): string
     return implode("\n", $out);
 }
 
-/** Chemin absolu du répertoire courant, pour les liens de playlist. */
 function unlock_script_relative(string $script): string
 {
     $dir = rtrim(str_replace('\\', '/', dirname((string)($_SERVER['SCRIPT_NAME'] ?? '/'))), '/');
     return $dir . '/' . $script;
 }
 
-/** Vérifie qu'une URL de segment appartient bien au CDN média. */
 function unlock_allowed_source(string $url): bool
 {
     $host = parse_url($url, PHP_URL_HOST);
