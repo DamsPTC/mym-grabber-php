@@ -8,13 +8,13 @@
 //     la playlist variante .m3u8 et tous les segments .ts SANS Policy/Signature,
 //     alors que la playlist master et les images renvoient 403 MissingKey.
 //
-// LIMITE MESURÉE : sur un post VERROUILLÉ, l'API anonyme laisse `url` à null et
-// renvoie une vignette à clé plate. Le dossier S3 reste daté, et `created_at`
-// est porté par le MÉDIA (pas par le post). Un post libre du même profil expose,
-// lui, une URL complète. Le préfixe d'un média verrouillé se déduit donc d'un
-// média libre de la même journée.
+// `created_at` est porté par le MÉDIA. Sur un post verrouillé, `url` reste null
+// et la vignette est à clé plate ; le dossier S3 se déduit alors d'un média libre
+// publié le même jour (le player MYM fait de même : le dossier est partagé par
+// upload). Le CDN exige un Referer mym.fans pour servir les segments.
 
 const UNLOCK_API   = 'https://styx.mym.fans';
+const UNLOCK_WEB   = 'https://mym.fans';
 const UNLOCK_MEDIA = 'https://media.prod-v2.mym.fans';
 const UNLOCK_QUALITIES = ['1080p', '720p', '480p', '360p'];
 const UNLOCK_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36';
@@ -54,6 +54,18 @@ function unlock_http(string $url, array $options = []): array
     return ['status' => $status, 'body' => $responseBody === false ? '' : $responseBody, 'type' => $type, 'error' => $error];
 }
 
+/** En-têtes attendus par le CDN média. */
+function unlock_media_headers(string $extra = ''): array
+{
+    $headers = [
+        'Referer: ' . UNLOCK_WEB . '/',
+        'Origin: ' . UNLOCK_WEB,
+        'Accept: */*',
+    ];
+    if ($extra !== '') $headers[] = $extra;
+    return $headers;
+}
+
 function unlock_sanitize_user(string $username): string
 {
     $username = trim($username);
@@ -77,7 +89,6 @@ function unlock_decode_descriptor(string $descriptor): ?array
     return is_array($json) ? $json : null;
 }
 
-/** Préfixe S3 depuis une URL média (chemin direct ou descripteur v2). */
 function unlock_prefix_from_url(string $url): ?string
 {
     if ($url === '' || strpos($url, UNLOCK_MEDIA . '/') !== 0) return null;
@@ -127,10 +138,7 @@ function unlock_list_posts(string $username, int $limit = 30): array
     return is_array($payload) ? ($payload['data'] ?? []) : [];
 }
 
-/**
- * Préfixe d'un média libre publié le même jour (AAAA-MM-JJ).
- * La date est portée par le média : chaque candidat est détaillé puis filtré.
- */
+/** Préfixe d'un média libre publié le même jour (AAAA-MM-JJ). */
 function unlock_sibling_prefix(string $username, string $date, int $maxProbes = 25): ?string
 {
     $listed = unlock_list_posts($username, 40);
@@ -153,11 +161,12 @@ function unlock_sibling_prefix(string $username, string $date, int $maxProbes = 
     return null;
 }
 
+/** Première qualité réellement servie pour un préfixe. */
 function unlock_first_quality(string $prefix, string $uuid): ?string
 {
     $base = UNLOCK_MEDIA . '/' . $prefix . '/HLS/' . $uuid;
     foreach (UNLOCK_QUALITIES as $candidate) {
-        $probe = unlock_http($base . '_' . $candidate . '.m3u8', ['timeout' => 15]);
+        $probe = unlock_http($base . '_' . $candidate . '.m3u8', ['timeout' => 15, 'headers' => unlock_media_headers()]);
         if ($probe['status'] === 200) return $candidate;
     }
     return null;
@@ -234,7 +243,7 @@ function unlock_resolve(string $username, string $postId): array
 
 function unlock_playlist_lines(string $playlistUrl): array
 {
-    $response = unlock_http($playlistUrl, ['timeout' => 20]);
+    $response = unlock_http($playlistUrl, ['timeout' => 20, 'headers' => unlock_media_headers()]);
     if ($response['status'] !== 200) return [null, []];
     $prefix = '';
     if (preg_match('~^(https://[^/]+/.*/)HLS/~', $playlistUrl, $match)) $prefix = $match[1] . 'HLS/';
