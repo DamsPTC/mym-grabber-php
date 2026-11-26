@@ -1,5 +1,5 @@
 <?php
-// unlock/debug.php — diagnostic de la structure et du décodage
+// unlock/debug.php — diagnostic: où trouver le préfixe S3 réellement ?
 require __DIR__ . '/lib.php';
 
 $username = isset($_GET['u']) ? unlock_sanitize_user((string)$_GET['u']) : 'Maximeyedess';
@@ -10,37 +10,44 @@ header('Content-Type: application/json; charset=utf-8');
 $fetched = unlock_fetch_post($username, $postId);
 if (isset($fetched['error'])) { echo json_encode(['error' => $fetched['error']]); exit; }
 
-$post = $fetched['post'];
-$out = [
-    'postKeys' => array_keys($post),
-    'gate' => $post['gate'] ?? null,
-    'nGroups' => count($post['medias'] ?? []),
-    'groupShapes' => [],
-    'collected' => [],
-];
+$out = ['candidates' => []];
 
-foreach (($post['medias'] ?? []) as $i => $group) {
-    $shape = array_keys($group);
-    $out['groupShapes'][] = $shape;
-    $out['teaser' . $i] = isset($group['teaser']) ? array_keys($group['teaser']) : null;
-    $out['teaserThumb' . $i] = isset($group['teaser']['thumbnail_url']) ? substr($group['teaser']['thumbnail_url'], 0, 50) : null;
+foreach (($fetched['post']['medias'] ?? []) as $media) {
+    foreach (['thumbnail_url', 'blurry_url', 'url'] as $field) {
+        $value = (string)($media[$field] ?? '');
+        if ($value === '') continue;
+        $entry = ['field' => $field, 'len' => strlen($value)];
+        if (preg_match('~/medias/v2/([^?]+)~', $value, $m)) {
+            $desc = unlock_decode_descriptor($m[1]);
+            $entry['key'] = is_array($desc) ? ($desc['key'] ?? null) : 'DECODE_FAIL';
+            $entry['hasThumbDir'] = is_array($desc) && strpos((string)($desc['key'] ?? ''), '/thumbnails/') !== false;
+        } else {
+            $entry['raw'] = substr($value, 0, 90);
+        }
+        $out['candidates'][] = $entry;
+    }
 }
 
-// ce que le collecteur retient réellement
-foreach (unlock_collect_media($post) as $idx => $media) {
-    $thumb = (string)($media['thumbnail_url'] ?? '');
-    $prefix = unlock_media_prefix($media);
-    $entry = [
-        'keys' => array_keys($media),
-        'mime' => $media['mime_type'] ?? null,
-        'thumbLen' => strlen($thumb),
-        'prefix' => $prefix,
+// essai de reconstruction par date + nom de fichier du média
+foreach (($fetched['post']['medias'] ?? []) as $media) {
+    $name = (string)($media['filename'] ?? '');
+    $created = (string)($media['created_at'] ?? '');
+    if ($name === '' || $created === '') continue;
+    $base = preg_replace('~\.m3u8$~', '', $name);
+    $datePath = str_replace('-', '/', substr($created, 0, 10));
+    $guesses = [
+        'date+filename' => UNLOCK_MEDIA . '/medias/' . $datePath . '/' . $base . '/HLS/' . $base . '_720p.m3u8',
+        'date+thumbname' => null,
     ];
-    if ($thumb !== '' && preg_match('~/medias/v2/([^?]+)~', $thumb, $m)) {
-        $desc = unlock_decode_descriptor($m[1]);
-        $entry['key'] = is_array($desc) ? ($desc['key'] ?? null) : 'DECODE_FAIL';
+    if (preg_match('~^(\d{14})-([A-Za-z0-9]+)~', $base, $mm)) {
+        $guesses['date+folder'] = UNLOCK_MEDIA . '/medias/' . $datePath . '/' . $base . '/HLS/' . $base . '_720p.m3u8';
     }
-    $out['collected'][] = $entry;
+    $out['guesses'] = [];
+    foreach ($guesses as $label => $url) {
+        if ($url === null) continue;
+        $r = unlock_http($url, ['timeout' => 12]);
+        $out['guesses'][$label] = $r['status'] . ' ' . substr($url, -70);
+    }
 }
 
 echo json_encode($out, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
