@@ -95,7 +95,7 @@ function unlock_media_prefix(array $media): ?string
     return explode('/thumbnails/', $key)[0];
 }
 
-/** Interroge l'API : liste des posts, puis détail d'un post précis. */
+/** Interroge l'API : détail d'un post précis. */
 function unlock_fetch_post(string $username, string $postId): array
 {
     $response = unlock_http(
@@ -127,8 +127,8 @@ function unlock_list_posts(string $username, int $limit = 30): array
 }
 
 /**
- * Résolution d'un post : gate, qualité disponible et playlist réécrite.
- * Retourne une structure prête à l'affichage, sans jamais exposer d'URL signée.
+ * Résolution d'un post : gate, qualité disponible, playlist réécrite.
+ * Aucune URL signée n'est exposée au navigateur.
  */
 function unlock_resolve(string $username, string $postId): array
 {
@@ -164,7 +164,6 @@ function unlock_resolve(string $username, string $postId): array
                 $result['items'][] = $entry;
                 continue;
             }
-            $entry['prefix'] = $prefix;
             $uuid = basename($prefix);
             $base = UNLOCK_MEDIA . '/' . $prefix . '/HLS/' . $uuid;
 
@@ -184,7 +183,8 @@ function unlock_resolve(string $username, string $postId): array
             $entry['signed']  = false;
             $entry['prefix']  = $prefix;
             $entry['uuid']    = $uuid;
-            $entry['playlist'] = unlock_rewrite_playlist($base . '_' . $quality . '.m3u8');
+            // Playlist absolue pour hls.js dans une data-URI.
+            $entry['playlist_abs'] = unlock_absolutize_playlist($base . '_' . $quality . '.m3u8');
             $result['items'][] = $entry;
             continue;
         }
@@ -198,26 +198,52 @@ function unlock_resolve(string $username, string $postId): array
     return $result;
 }
 
-/** Télécharge une playlist et remplace les noms de segments par le proxy local. */
-function unlock_rewrite_playlist(string $playlistUrl): string
+/** Découpe une playlist en lignes, et renvoie [prefixe, lignes]. */
+function unlock_playlist_lines(string $playlistUrl): array
 {
     $response = unlock_http($playlistUrl, ['timeout' => 20]);
-    if ($response['status'] !== 200) return '';
-
+    if ($response['status'] !== 200) return [null, []];
     $prefix = '';
     if (preg_match('~^(https://[^/]+/.*/)HLS/~', $playlistUrl, $match)) {
-        $prefix = $match[1];
+        $prefix = $match[1] . 'HLS/';
     }
+    return [$prefix, preg_split('~\r?\n~', trim($response['body']))];
+}
 
-    $lines = preg_split('~\r?\n~', trim($response['body']));
+/** Playlist avec segments en URL absolues (pour data-URI / hls.js). */
+function unlock_absolutize_playlist(string $playlistUrl): string
+{
+    [$prefix, $lines] = unlock_playlist_lines($playlistUrl);
+    if ($prefix === null) return '';
     $out = [];
     foreach ($lines as $line) {
         $trimmed = trim($line);
         if ($trimmed === '' || $trimmed[0] === '#') { $out[] = $line; continue; }
-        $absolute = ($prefix !== '' && !preg_match('~^https?://~', $trimmed)) ? $prefix . 'HLS/' . $trimmed : $trimmed;
-        $out[] = 'segment.php?src=' . rawurlencode($absolute);
+        $out[] = preg_match('~^https?://~', $trimmed) ? $trimmed : $prefix . $trimmed;
     }
     return implode("\n", $out);
+}
+
+/** Playlist avec segments routés par le proxy local (téléchargement ffmpeg). */
+function unlock_rewrite_playlist(string $playlistUrl): string
+{
+    [$prefix, $lines] = unlock_playlist_lines($playlistUrl);
+    if ($prefix === null) return '';
+    $out = [];
+    foreach ($lines as $line) {
+        $trimmed = trim($line);
+        if ($trimmed === '' || $trimmed[0] === '#') { $out[] = $line; continue; }
+        $absolute = preg_match('~^https?://~', $trimmed) ? $trimmed : $prefix . $trimmed;
+        $out[] = unlock_script_relative('segment.php') . '?src=' . rawurlencode($absolute);
+    }
+    return implode("\n", $out);
+}
+
+/** Chemin absolu du répertoire courant, pour les liens de playlist. */
+function unlock_script_relative(string $script): string
+{
+    $dir = rtrim(str_replace('\\', '/', dirname((string)($_SERVER['SCRIPT_NAME'] ?? '/'))), '/');
+    return $dir . '/' . $script;
 }
 
 /** Vérifie qu'une URL de segment appartient bien au CDN média. */
